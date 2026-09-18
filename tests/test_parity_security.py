@@ -234,6 +234,48 @@ def test_background_tasks(pair):
     assert g_fx == f_fx == ["done"]
 
 
+def test_background_queued_in_dependency_and_order():
+    g_events: list[str] = []
+    f_events: list[str] = []
+
+    def build_g():  # type: ignore[no-untyped-def]
+        app = GFastAPI()
+
+        async def dep(bg: GBackgroundTasks):
+            bg.add_task(g_events.append, "dep-task")
+            g_events.append("dep-enter")
+            yield "dep"
+            g_events.append("dep-exit")
+
+        @app.get("/w")
+        async def w(bg: GBackgroundTasks, d= GDepends(dep)):
+            bg.add_task(g_events.append, "ep-task")
+            return {"d": d}
+
+        return app
+
+    def build_f():  # type: ignore[no-untyped-def]
+        app = F.FastAPI()
+
+        async def dep(bg: FBackgroundTasks):
+            bg.add_task(f_events.append, "dep-task")
+            f_events.append("dep-enter")
+            yield "dep"
+            f_events.append("dep-exit")
+
+        @app.get("/w")
+        async def w(bg: FBackgroundTasks, d= FDepends(dep)):
+            bg.add_task(f_events.append, "ep-task")
+            return {"d": d}
+
+        return app
+
+    with GTestClient(build_g()) as gc, F.TestClient(build_f()) as fc:
+        assert gc.get("/w").json() == fc.get("/w").json() == {"d": "dep"}
+        assert g_events == f_events, (g_events, f_events)
+        assert g_events == ["dep-enter", "dep-task", "ep-task", "dep-exit"]
+
+
 def test_encoder_types(pair):
     gc, fc, _, _ = pair
     a = gc.get("/stamp")

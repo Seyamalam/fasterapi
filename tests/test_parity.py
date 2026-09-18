@@ -290,6 +290,34 @@ def test_body_create_parity(fastapi_client, fasterapi_client):
     assert b.json()["id"] == 42
 
 
+def test_response_model_flags_parity():
+    from pydantic import BaseModel as _BM
+
+    class _Big(_BM):
+        a: int
+        b: int = 5
+        c: Optional[str] = None
+
+    def build(cls, **kw):  # type: ignore[no-untyped-def]
+        app = cls()
+
+        @app.get("/f", response_model=_Big, **kw)
+        async def f():
+            return {"a": 1, "b": 5, "c": None, "zzz": "dropped"}
+
+        return app
+
+    from fastapi.testclient import TestClient as _GT
+    for kw in [{"response_model_include": {"a"}},
+               {"response_model_exclude": {"b", "c"}},
+               {"response_model_exclude_unset": True},
+               {"response_model_exclude_none": True}]:
+        with _GT(build(GFastAPI, **kw)) as gc, F.TestClient(build(F.FastAPI, **kw)) as fc:
+            a, b = gc.get("/f"), fc.get("/f")
+            assert a.status_code == b.status_code == 200, kw
+            assert a.json() == b.json(), kw
+
+
 def test_body_validation_parity(fastapi_client, fasterapi_client):
     bad_payloads = [
         {"price": 9.5},                       # missing name
@@ -451,3 +479,52 @@ def test_websocket_echo_parity():
         with fc.websocket_connect("/ws") as fws:
             fws.send_text("hi")
             assert fws.receive_text() == "echo:hi"
+
+
+def test_websocket_auth_and_query_parity():
+    from fasterapi import HTTPException as _FHE
+    from fastapi import HTTPException as _GHE
+
+    def build_g():  # type: ignore[no-untyped-def]
+        app = GFastAPI()
+
+        async def check(token: str = ""):
+            if token != "s3cr3t":
+                raise _GHE(status_code=401, detail="bad token")
+            return token
+
+        @app.websocket("/wsa")
+        async def wsa(websocket: StarletteWS, token: str = GDepends(check)):
+            await websocket.accept()
+            await websocket.send_text(f"ok:{token}")
+            await websocket.close()
+
+        return app
+
+    def build_f():  # type: ignore[no-untyped-def]
+        app = F.FastAPI()
+
+        async def check(token: str = ""):
+            if token != "s3cr3t":
+                raise _FHE(status_code=401, detail="bad token")
+            return token
+
+        @app.websocket("/wsa")
+        async def wsa(websocket: StarletteWS, token: str = FDepends(check)):
+            await websocket.accept()
+            await websocket.send_text(f"ok:{token}")
+            await websocket.close()
+
+        return app
+
+    with GTestClient(build_g()) as gc, F.TestClient(build_f()) as fc:
+        with gc.websocket_connect("/wsa?token=s3cr3t") as gws:
+            assert gws.receive_text() == "ok:s3cr3t"
+        with fc.websocket_connect("/wsa?token=s3cr3t") as fws:
+            assert fws.receive_text() == "ok:s3cr3t"
+        for client in (gc, fc):
+            try:
+                with client.websocket_connect("/wsa?token=nope"):
+                    raise AssertionError("should not connect")
+            except Exception:
+                pass

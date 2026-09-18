@@ -46,6 +46,11 @@ class FastAPI(Starlette):
         **extra: Any,
     ) -> None:
         super().__init__(lifespan=lifespan, middleware=middleware)  # type: ignore[call-arg]
+        # Request lifetime stack first (innermost user middleware), exactly
+        # like FastAPI: `yield` teardowns run after background tasks.
+        from .middleware.asyncexitstack import AsyncExitStackMiddleware
+
+        self.add_middleware(AsyncExitStackMiddleware)
         self.title = title
         self.version = version
         self.description = description

@@ -372,6 +372,14 @@ async def _solve_fn_kwargs(
         if ann is SecurityScopes or (isinstance(ann, str) and ann == "SecurityScopes"):
             kwargs[pname] = SecurityScopes()
             continue
+        # --- WebSocket injection (websocket routes only) -----------------------
+        if ann is WebSocket or (isinstance(ann, str) and ann == "WebSocket"):
+            kwargs[pname] = request
+            continue
+        if pname in ("websocket", "ws", "connection") and default is inspect.Parameter.empty \
+                and ann is inspect.Parameter.empty and type(request).__name__ == "WebSocket":
+            kwargs[pname] = request
+            continue
 
         # --- Depends ----------------------------------------------------------
         if isinstance(default, Depends):
@@ -713,6 +721,12 @@ class _RouteDef:
         status_code: int = 200,
         response_class: Any = None,
         deprecated: bool = False,
+        response_model_include: Any = None,
+        response_model_exclude: Any = None,
+        response_model_by_alias: bool = True,
+        response_model_exclude_unset: bool = False,
+        response_model_exclude_defaults: bool = False,
+        response_model_exclude_none: bool = False,
         tags: Optional[list[str]] = None,
         summary: Optional[str] = None,
         description: Optional[str] = None,
@@ -726,6 +740,12 @@ class _RouteDef:
         self.status_code = status_code
         self.response_class = response_class
         self.deprecated = deprecated
+        self.response_model_include = response_model_include
+        self.response_model_exclude = response_model_exclude
+        self.response_model_by_alias = response_model_by_alias
+        self.response_model_exclude_unset = response_model_exclude_unset
+        self.response_model_exclude_defaults = response_model_exclude_defaults
+        self.response_model_exclude_none = response_model_exclude_none
         self.tags = tags or []
         self.summary = summary
         self.description = description
@@ -768,23 +788,35 @@ def _model_dump_direct(model_cls: Any) -> bool:
     return ok
 
 
-def _serialize_response(result: Any, response_model: Any, status_code: int = 200) -> Any:
+def _serialize_response(result: Any, route: _RouteDef) -> Any:
+    status_code = route.status_code
+    response_model = route.response_model
     if isinstance(result, Response):
         return result
     if response_model is not None:
+        dump_kw: dict[str, Any] = {
+            "include": route.response_model_include,
+            "exclude": route.response_model_exclude,
+            "by_alias": route.response_model_by_alias,
+            "exclude_unset": route.response_model_exclude_unset,
+            "exclude_defaults": route.response_model_exclude_defaults,
+            "exclude_none": route.response_model_exclude_none,
+        }
+        filtered = any(v is not None and v is not False for k, v in dump_kw.items() if k != "by_alias") \
+            or dump_kw["by_alias"] is False
         try:
-            if type(result) is response_model and _model_dump_direct(response_model):
+            if type(result) is response_model and _model_dump_direct(response_model) and not filtered:
                 # Already a valid instance with no transforming hooks:
                 # skip the revalidation round-trip, serialize directly.
                 return Response(
-                    content=_adapter(response_model).dump_json(result),
+                    content=_adapter(response_model).dump_json(result, **dump_kw),
                     status_code=status_code,
                     media_type="application/json",
                 )
             validated = _adapter(response_model).validate_python(result)
             # One Rust pass straight to JSON bytes — no intermediate dict.
             return Response(
-                content=_adapter(response_model).dump_json(validated),
+                content=_adapter(response_model).dump_json(validated, **dump_kw),
                 status_code=status_code,
                 media_type="application/json",
             )
@@ -804,8 +836,13 @@ def _serialize_response(result: Any, response_model: Any, status_code: int = 200
     return jsonable_encoder(result)
 
 
-def _make_http_handler(route: _RouteDef, router_deps: list[Depends]) -> Callable[[Request], Coroutine[Any, Any, Response]]:
-    async def handler(request: Request) -> Response:
+def _make_http_handler(route: _RouteDef, router_deps: list[Depends]) -> Callable[..., Any]:
+    async def asgi_app(scope: Any, receive: Any, send: Any) -> None:
+        # FastAPI's exact lifecycle: solve (yield enters) → endpoint →
+        # build response → attach background → SEND (background runs) → and
+        # only then close the stack (yield teardowns). Teardown therefore
+        # runs after background work, never before the response is sent.
+        request = Request(scope, receive, send)
         path_params = dict(request.path_params)
         query = dict(request.query_params)
         headers = {k.lower(): v for k, v in request.headers.items()}
@@ -813,7 +850,6 @@ def _make_http_handler(route: _RouteDef, router_deps: list[Depends]) -> Callable
         # Body: keep raw bytes only. The single-model fast path validates
         # straight from bytes; anything else parses lazily (cached) on use.
         body_raw: Optional[bytes] = None
-        body_json: Any = None
         form: Optional[dict[str, Any]] = None
         ctype = request.headers.get("content-type", "")
         if request.method in ("POST", "PUT", "PATCH", "DELETE"):
@@ -832,7 +868,6 @@ def _make_http_handler(route: _RouteDef, router_deps: list[Depends]) -> Callable
                         form[k] = v
                 except Exception:
                     form = {}
-        # Top-level + router-level dependencies (executed for side effects / guards).
         async with AsyncExitStack() as stack:
             cache: dict[int, Any] = {}
             try:
@@ -845,7 +880,7 @@ def _make_http_handler(route: _RouteDef, router_deps: list[Depends]) -> Callable
                     sub = await _solve_fn_kwargs(
                         dep.dependency, request=request, path_params=path_params,
                         query=query, headers=headers, cookies=cookies,
-                        body_json=body_json, form=form, cache=cache, stack=stack,
+                        body_json=None, form=form, cache=cache, stack=stack,
                         body_raw=body_raw,
                     )
                     val = await _call_with_teardown(dep.dependency, sub, stack)
@@ -854,14 +889,16 @@ def _make_http_handler(route: _RouteDef, router_deps: list[Depends]) -> Callable
                 kwargs = await _solve_fn_kwargs(
                     route.endpoint, request=request, path_params=path_params,
                     query=query, headers=headers, cookies=cookies,
-                    body_json=body_json, form=form, cache=cache, stack=stack,
+                    body_json=None, form=form, cache=cache, stack=stack,
                     body_raw=body_raw,
                 )
             except RequestValidationError as exc:
-                return JSONResponse({"detail": exc.errors()}, status_code=422)
+                await JSONResponse({"detail": exc.errors()}, status_code=422)(scope, receive, send)
+                return
             except HTTPException as exc:
-                return JSONResponse({"detail": exc.detail}, status_code=exc.status_code,
-                                    headers=exc.headers or {})
+                await JSONResponse({"detail": exc.detail}, status_code=exc.status_code,
+                                   headers=exc.headers or {})(scope, receive, send)
+                return
             try:
                 if inspect.iscoroutinefunction(route.endpoint):
                     result = await route.endpoint(**kwargs)
@@ -870,30 +907,36 @@ def _make_http_handler(route: _RouteDef, router_deps: list[Depends]) -> Callable
                     if inspect.isawaitable(result):
                         result = await result
             except HTTPException as exc:
-                return JSONResponse({"detail": exc.detail}, status_code=exc.status_code,
-                                    headers=exc.headers or {})
+                await JSONResponse({"detail": exc.detail}, status_code=exc.status_code,
+                                   headers=exc.headers or {})(scope, receive, send)
+                return
             except RequestValidationError as exc:
-                return JSONResponse({"detail": exc.errors()}, status_code=422)
+                await JSONResponse({"detail": exc.errors()}, status_code=422)(scope, receive, send)
+                return
             # SSE: generator endpoint + EventSourceResponse streams frames.
             if _is_sse_route(route) and (inspect.isasyncgen(result) or inspect.isgenerator(result)):
-                return _with_background(_sse_response(result, route.status_code), cache)
+                await _with_background(_sse_response(result, route.status_code), cache)(scope, receive, send)
+                return
             try:
-                payload = _serialize_response(result, route.response_model, route.status_code)
+                payload = _serialize_response(result, route)
             except Exception as exc:
                 from .exceptions import ResponseValidationError
 
                 if isinstance(exc, ResponseValidationError):
-                    return JSONResponse({"detail": exc.errors()}, status_code=500)
+                    await JSONResponse({"detail": exc.errors()}, status_code=500)(scope, receive, send)
+                    return
                 raise
             if payload is None:
-                return _with_background(Response(status_code=route.status_code), cache)
+                await _with_background(Response(status_code=route.status_code), cache)(scope, receive, send)
+                return
             if isinstance(payload, Response):
-                return _with_background(payload, cache)
-            return _with_background(JSONResponse(payload, status_code=route.status_code), cache)
+                await _with_background(payload, cache)(scope, receive, send)
+                return
+            await _with_background(JSONResponse(payload, status_code=route.status_code), cache)(scope, receive, send)
 
     # Name the handler for Starlette route introspection.
-    handler.__name__ = getattr(route.endpoint, "__name__", "handler")  # type: ignore[attr-defined]
-    return handler
+    asgi_app.__name__ = getattr(route.endpoint, "__name__", "handler")  # type: ignore[attr-defined]
+    return asgi_app
 
 
 def _with_background(response: Response, cache: dict[int, Any]) -> Response:
@@ -997,6 +1040,12 @@ class APIRouter:
         summary: Optional[str] = None,
         description: Optional[str] = None,
         deprecated: bool = False,
+        response_model_include: Any = None,
+        response_model_exclude: Any = None,
+        response_model_by_alias: bool = True,
+        response_model_exclude_unset: bool = False,
+        response_model_exclude_defaults: bool = False,
+        response_model_exclude_none: bool = False,
         dependencies: Optional[list[Depends]] = None,
         name: Optional[str] = None,
         **_extra: Any,
@@ -1010,6 +1059,12 @@ class APIRouter:
                 full, endpoint, methods or ["GET"],
                 response_model=response_model, status_code=status_code,
                 response_class=rc, deprecated=deprecated,
+                response_model_include=response_model_include,
+                response_model_exclude=response_model_exclude,
+                response_model_by_alias=response_model_by_alias,
+                response_model_exclude_unset=response_model_exclude_unset,
+                response_model_exclude_defaults=response_model_exclude_defaults,
+                response_model_exclude_none=response_model_exclude_none,
                 tags=[*(self.tags or []), *(tags or [])],
                 summary=summary, description=description,
                 dependencies=[*self.dependencies, *(dependencies or [])],
@@ -1085,6 +1140,12 @@ class APIRouter:
                 prefix.rstrip("/") + r.path, r.endpoint, r.methods,
                 response_model=r.response_model, status_code=r.status_code,
                 response_class=r.response_class, deprecated=r.deprecated,
+                response_model_include=r.response_model_include,
+                response_model_exclude=r.response_model_exclude,
+                response_model_by_alias=r.response_model_by_alias,
+                response_model_exclude_unset=r.response_model_exclude_unset,
+                response_model_exclude_defaults=r.response_model_exclude_defaults,
+                response_model_exclude_none=r.response_model_exclude_none,
                 tags=[*r.tags, *extra_tags], summary=r.summary,
                 description=r.description,
                 dependencies=[*r.dependencies, *extra_deps], name=r.name,
@@ -1099,12 +1160,13 @@ class APIRouter:
     def _starlette_routes(self) -> list[Any]:
         out: list[Any] = []
         for r in self.routes:
-            out.append(
-                StarletteRoute(
-                    r.path, _make_http_handler(r, []),
-                    methods=r.methods, name=r.name,
-                )
-            )
+            # Our handler is already a full ASGI app (solve → send inside the
+            # teardown stack, like FastAPI) — bypass Starlette's
+            # request_response wrapper which expects (Request) -> Response.
+            sr = StarletteRoute(r.path, lambda _req: Response(status_code=500),  # placeholder
+                                methods=r.methods, name=r.name)
+            sr.app = _make_http_handler(r, [])
+            out.append(sr)
         for path, fn, name in self.websocket_routes:
             out.append(WebSocketRoute(path, _make_ws_handler(fn), name=name))
         return out
@@ -1112,31 +1174,18 @@ class APIRouter:
 
 def _make_ws_handler(fn: Callable[..., Any]) -> Callable[[WebSocket], Coroutine[Any, Any, None]]:
     async def handler(ws: WebSocket) -> None:
-        # Minimal Depends support for websockets: inject by name where possible.
+        # The socket injects via _solve_fn_kwargs (WebSocket branch); every
+        # other param (Query/Path/Depends/…) solves uniformly like HTTP.
         try:
-            sig = inspect.signature(fn)
-            kwargs: dict[str, Any] = {}
             async with AsyncExitStack() as stack:
                 cache: dict[int, Any] = {}
-                for pname, param in sig.parameters.items():
-                    ann = _ann_of(fn, pname, param.annotation)
-                    if isinstance(param.default, Depends) and param.default.dependency is not None:
-                        dep = param.default.dependency
-                        sub = await _solve_fn_kwargs(
-                            dep, request=ws, path_params=dict(ws.path_params),  # type: ignore[arg-type]
-                            query=dict(ws.query_params), headers={k.lower(): v for k, v in ws.headers.items()},
-                            cookies=dict(ws.cookies), body_json=None, form=None,
-                            cache=cache, stack=stack,
-                        )
-                        kwargs[pname] = await _call_with_teardown(dep, sub, stack)
-                    elif ann is WebSocket or pname in ("websocket", "ws", "connection"):
-                        kwargs[pname] = ws
-                    elif pname == "self":
-                        continue
-                    elif param.default is inspect.Parameter.empty:
-                        # Unannotated single-arg websocket endpoint: assume the socket.
-                        if len(sig.parameters) == 1:
-                            kwargs[pname] = ws
+                kwargs = await _solve_fn_kwargs(
+                    fn, request=ws, path_params=dict(ws.path_params),  # type: ignore[arg-type]
+                    query=dict(ws.query_params),
+                    headers={k.lower(): v for k, v in ws.headers.items()},
+                    cookies=dict(ws.cookies), body_json=None, form=None,
+                    cache=cache, stack=stack,
+                )
                 if inspect.iscoroutinefunction(fn):
                     await fn(**kwargs)
                 else:

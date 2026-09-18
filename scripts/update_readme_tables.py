@@ -194,7 +194,8 @@ def render_bench(micro: dict, macro: dict | None, has_rust: bool) -> str:
         except Exception:
             mtime = "unknown date"
         lines += [
-            f"Run: `{mtime}`, speedup **x{macro.get('speedup_rps', '?')}** "
+            f"Run: `{mtime}`, host `{macro.get('fasterapi_server', 'uvicorn')}`, "
+            f"speedup **x{macro.get('speedup_rps', '?')}** "
             f"(pre-push: micro strict 3x + macro parity band x0.95).",
             "",
             "| Server | RPS | p50 | p90 | p99 | RSS |",
