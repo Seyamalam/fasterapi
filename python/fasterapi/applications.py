@@ -317,23 +317,25 @@ class FastAPI(Starlette):
 
     # -- serve -------------------------------------------------------------------
     def serve(self, host: str = "127.0.0.1", port: int = 8000, **kw: Any) -> None:
-        """Run the app. Uses uvicorn today; Hyper host when ``FASTERAPI_HYPER=1``.
+        """Run the app: Rust Hyper host when ``FASTERAPI_HYPER=1``, else uvicorn.
 
-        The inverted-runtime Hyper server (Rust owns the socket) is staged in
-        ``src/lib.rs``; until it is promoted, ``serve()`` runs the same
-        battle-tested uvicorn loop FastAPI uses so behavior stays identical.
+        The Hyper host owns sockets + HTTP parsing in Rust and drives this
+        same app object in-process (lifespan included), so bytes stay
+        identical to uvicorn. Spike limits are documented in ``src/lib.rs``.
         """
         import os
 
+        self.build()
         if os.environ.get("FASTERAPI_HYPER") == "1" and _bridge.HAS_RUST:
             try:
-                from ._fasterapi_rs import hyper_health  # type: ignore
+                from ._fasterapi_rs import serve_asgi  # type: ignore
             except ImportError:
-                from _fasterapi_rs import hyper_health  # type: ignore
+                from _fasterapi_rs import serve_asgi  # type: ignore
 
-            print(hyper_health())
-            print("fasterapi: Hyper host staged — falling through to uvicorn for v0.1 parity.")
+            workers = kw.pop("workers", 0) or None
+            print(f"fasterapi: serving on http://{host}:{port} via Rust Hyper host", flush=True)
+            serve_asgi(self, host, port, workers)
+            return
         import uvicorn
 
-        self.build()
         uvicorn.run(self, host=host, port=port, **kw)

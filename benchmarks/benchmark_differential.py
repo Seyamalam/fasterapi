@@ -98,13 +98,22 @@ def wait_ready(port: int, timeout: float = 20.0) -> bool:
     return False
 
 
-def start_server(app_file: Path, port: int) -> subprocess.Popen:
+def start_server(app_file: Path, port: int, *, hyper: bool = False) -> subprocess.Popen:
+    if hyper:
+        cmd = [sys.executable, "-m", "fasterapi", "run", f"{app_file.stem}:app",
+               "--host", "127.0.0.1", "--port", str(port), "--hyper"]
+    else:
+        cmd = [sys.executable, "-m", "uvicorn", f"{app_file.stem}:app",
+               "--host", "127.0.0.1", "--port", str(port), "--log-level", "warning"]
+    env = dict(os.environ)
+    # Bench runs must not inherit a forced host mode from the caller shell.
+    env.pop("FASTERAPI_HYPER", None)
     return subprocess.Popen(
-        [sys.executable, "-m", "uvicorn", f"{app_file.stem}:app",
-         "--host", "127.0.0.1", "--port", str(port), "--log-level", "warning"],
+        cmd,
         cwd=str(app_file.parent),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        env=env,
     )
 
 
@@ -306,6 +315,8 @@ def main() -> int:
     ap.add_argument("--min-speedup", type=float, default=1.0)
     ap.add_argument("--json-out", type=str, default="")
     ap.add_argument("--endpoint", type=str, default="/ping")
+    ap.add_argument("--fasterapi-server", choices=["uvicorn", "hyper"], default="hyper",
+                    help="host for the fasterapi side (default: hyper Rust host)")
     args = ap.parse_args()
 
     if args.quick:
@@ -320,7 +331,7 @@ def main() -> int:
           f"model_dump x{micro['model_dump_speedup']} "
           f"router x{micro['router_match_speedup']}")
 
-    result: dict = {"micro": micro, "macro": None}
+    result: dict = {"micro": micro, "macro": None, "fasterapi_server": args.fasterapi_server}
 
     if not args.micro_only:
         tmp = Path(tempfile.mkdtemp(prefix="fasterapi-bench-"))
@@ -328,7 +339,7 @@ def main() -> int:
         p1 = p2 = None
         try:
             p1 = start_server(fastapi_app, FASTAPI_PORT)
-            p2 = start_server(fasterapi_app, FASTERAPI_PORT)
+            p2 = start_server(fasterapi_app, FASTERAPI_PORT, hyper=args.fasterapi_server == "hyper")
             ok1, ok2 = wait_ready(FASTAPI_PORT), wait_ready(FASTERAPI_PORT)
             if not (ok1 and ok2):
                 print("ERROR: servers failed to start", file=sys.stderr)
