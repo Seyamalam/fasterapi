@@ -712,6 +712,7 @@ class _RouteDef:
         response_model: Any = None,
         status_code: int = 200,
         response_class: Any = None,
+        deprecated: bool = False,
         tags: Optional[list[str]] = None,
         summary: Optional[str] = None,
         description: Optional[str] = None,
@@ -724,6 +725,7 @@ class _RouteDef:
         self.response_model = response_model
         self.status_code = status_code
         self.response_class = response_class
+        self.deprecated = deprecated
         self.tags = tags or []
         self.summary = summary
         self.description = description
@@ -731,11 +733,54 @@ class _RouteDef:
         self.name = name or getattr(endpoint, "__name__", path)
 
 
+# Models whose instances serialize identically with and without a
+# revalidation round-trip (no validators/serializers that could transform).
+_MODEL_PASSTHROUGH: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def _model_dump_direct(model_cls: Any) -> bool:
+    """True when `dump_json(instance)` == `dump_json(validate(instance))`."""
+    try:
+        direct = _MODEL_PASSTHROUGH.get(model_cls)
+    except TypeError:
+        direct = None
+    if direct is not None:
+        return direct
+    try:
+        dec = getattr(model_cls, "__pydantic_decorators__", None)
+        decs = getattr(dec, "decorators", {}) if dec is not None else {}
+        if decs:
+            ok = False
+        else:
+            # Field-level validators/serializers live on the fields.
+            ok = True
+            fields = getattr(model_cls, "model_fields", {}) or {}
+            for f in fields.values():
+                if getattr(f, "validators", None) or getattr(f, "serializer", None):
+                    ok = False
+                    break
+    except Exception:
+        ok = False
+    try:
+        _MODEL_PASSTHROUGH[model_cls] = ok
+    except TypeError:
+        pass
+    return ok
+
+
 def _serialize_response(result: Any, response_model: Any, status_code: int = 200) -> Any:
     if isinstance(result, Response):
         return result
     if response_model is not None:
         try:
+            if type(result) is response_model and _model_dump_direct(response_model):
+                # Already a valid instance with no transforming hooks:
+                # skip the revalidation round-trip, serialize directly.
+                return Response(
+                    content=_adapter(response_model).dump_json(result),
+                    status_code=status_code,
+                    media_type="application/json",
+                )
             validated = _adapter(response_model).validate_python(result)
             # One Rust pass straight to JSON bytes — no intermediate dict.
             return Response(
@@ -951,6 +996,7 @@ class APIRouter:
         tags: Optional[list[str]] = None,
         summary: Optional[str] = None,
         description: Optional[str] = None,
+        deprecated: bool = False,
         dependencies: Optional[list[Depends]] = None,
         name: Optional[str] = None,
         **_extra: Any,
@@ -963,7 +1009,7 @@ class APIRouter:
             _RouteDef(
                 full, endpoint, methods or ["GET"],
                 response_model=response_model, status_code=status_code,
-                response_class=rc,
+                response_class=rc, deprecated=deprecated,
                 tags=[*(self.tags or []), *(tags or [])],
                 summary=summary, description=description,
                 dependencies=[*self.dependencies, *(dependencies or [])],
@@ -1038,7 +1084,7 @@ class APIRouter:
             merged = _RouteDef(
                 prefix.rstrip("/") + r.path, r.endpoint, r.methods,
                 response_model=r.response_model, status_code=r.status_code,
-                response_class=r.response_class,
+                response_class=r.response_class, deprecated=r.deprecated,
                 tags=[*r.tags, *extra_tags], summary=r.summary,
                 description=r.description,
                 dependencies=[*r.dependencies, *extra_deps], name=r.name,

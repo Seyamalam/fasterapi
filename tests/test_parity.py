@@ -58,6 +58,11 @@ class ItemOut(Item):
     id: int
 
 
+class Cart(BaseModel):
+    items: list[Item]
+    note: Optional[str] = None
+
+
 # ------------------------------------------------------- app builders ---
 
 def build_fastapi_app() -> GFastAPI:
@@ -393,6 +398,31 @@ def test_openapi_shapes():
     for path, item in g["paths"].items():
         assert set(item) == set(f["paths"][path]), path
     assert "Item" in f["components"]["schemas"] or "Item" in str(f["components"])
+
+
+def test_openapi_full_equality():
+    def build(cls):  # type: ignore[no-untyped-def]
+        app = cls(title="T", version="1", description="demo")
+
+        @app.get("/items/{item_id}", response_model=Item, tags=["t"], summary="Read")
+        def r(item_id: int, q: Optional[str] = None, limit: int = 10):
+            return {}
+
+        @app.post("/items", response_model=Item)
+        def c(item: Item):
+            return item
+
+        @app.post("/cart", response_model=Cart)
+        def cart(cart: Cart):
+            return cart
+
+        @app.get("/h", deprecated=True)
+        def h(x_token: str = ""):
+            return {}
+
+        return app
+
+    assert build(GFastAPI).openapi() == build(F.FastAPI).openapi()
 
 
 def test_websocket_echo_parity():

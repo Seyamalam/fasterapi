@@ -11,7 +11,6 @@ from __future__ import annotations
 import inspect
 from typing import Any, Callable, Optional
 
-from pydantic import BaseModel
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
@@ -22,7 +21,6 @@ from .dag import CompiledDAG, compile_app_dag
 from .exceptions import HTTPException, RequestValidationError
 from .params import Depends
 from .routing import APIRouter
-from .utils import generate_unique_id as _unique_id
 
 
 class FastAPI(Starlette):
@@ -222,67 +220,16 @@ class FastAPI(Starlette):
             return res if isinstance(res, Response) else JSONResponse(res)
         return JSONResponse({"detail": exc.detail}, status_code=exc.status_code, headers=exc.headers or {})
 
-    # -- openapi (minimal but valid) -------------------------------------------
+    # -- openapi ---------------------------------------------------------------
     def openapi(self) -> dict[str, Any]:
-        paths: dict[str, Any] = {}
-        components: dict[str, Any] = {"schemas": {}}
-        for r in self._router.routes:
-            item: dict[str, Any] = paths.setdefault(r.path, {})
-            try:
-                sig = inspect.signature(r.endpoint)
-            except (TypeError, ValueError):
-                sig = None
-            params: list[dict[str, Any]] = []
-            has_body = False
-            body_schema: dict[str, Any] = {}
-            if sig is not None:
-                from .params import Param as _P
-                from .routing import _is_pydantic_model as _is_model
+        from .openapi.utils import get_openapi
 
-                for pname, p in sig.parameters.items():
-                    d = p.default
-                    ann = p.annotation
-                    if isinstance(d, _P) and d.in_ in ("query", "path", "header", "cookie"):
-                        params.append({
-                            "name": d.alias or pname,
-                            "in": d.in_,
-                            "required": d.required and p.default is inspect.Parameter.empty or d.default is Ellipsis,
-                            "schema": {"type": "string"},
-                            "description": d.description or "",
-                        })
-                    elif _is_model(ann):
-                        has_body = True
-                        try:
-                            schema = ann.model_json_schema(ref_template="#/components/schemas/{model}")
-                            components["schemas"][ann.__name__] = schema
-                            body_schema = {"$ref": f"#/components/schemas/{ann.__name__}"}
-                        except Exception:
-                            body_schema = {"type": "object"}
-                    elif pname in r.path:
-                        params.append({"name": pname, "in": "path", "required": True,
-                                       "schema": {"type": "string"}})
-            op: dict[str, Any] = {
-                "summary": r.summary or r.name,
-                "description": r.description or "",
-                "operationId": _unique_id(r),
-                "tags": r.tags,
-                "parameters": params,
-                "responses": {str(r.status_code): {"description": "Successful Response"}},
-            }
-            if has_body:
-                op["requestBody"] = {"content": {"application/json": {"schema": body_schema}}}
-            if r.response_model is not None and inspect.isclass(r.response_model) and issubclass(r.response_model, BaseModel):
-                try:
-                    components["schemas"][r.response_model.__name__] = r.response_model.model_json_schema(
-                        ref_template="#/components/schemas/{model}"
-                    )
-                except Exception:
-                    pass
-            for m in r.methods:
-                item[m.lower()] = op
-        return {"openapi": "3.1.0", "info": {"title": self.title, "version": self.version,
-                                             "description": self.description},
-                "paths": paths, "components": components}
+        return get_openapi(
+            title=self.title,
+            version=self.version,
+            description=self.description,
+            routes=self._router.routes,
+        )
 
     # -- Phase-2: AOT build ------------------------------------------------------
     def build(self) -> CompiledDAG:
