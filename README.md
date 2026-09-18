@@ -118,11 +118,12 @@ pytest tests/ -q
 
 | Suite | Tests | Result |
 |---|---|---|
-| Differential (`tests/test_parity.py`, FastAPI vs fasterapi) | 16 | all passing |
+| Differential (`tests/test_parity.py`, FastAPI vs fasterapi) | 17 | all passing |
+| Auth/background/encoders (`tests/test_parity_security.py`) | 7 | all passing |
 | Native (`tests/test_fasterapi_native.py`) | 6 | all passing |
-| **Total** | **22** | **29 passed** |
+| **Total** | **30** | **30 passed** |
 
-Coverage: ping, path/query/header/cookie params, validation shapes (422 `loc`/`type`), JSON body + `response_model`, Form, file upload, DI order + `yield` teardown, `HTTPException`, custom handlers, router prefixes, OpenAPI shapes, websockets, guards, DAG, Rust bridge.
+Coverage: ping, path/query/header/cookie params, validation shapes (422 `loc`/`type`/`ctx`, multi-error, malformed-JSON `json_invalid`), JSON body + `response_model`, Form, file upload, DI order + `yield` teardown, `HTTPException`, custom handlers, router prefixes, OpenAPI shapes, websockets, guards, DAG, Rust bridge, OAuth2/HTTP/API-key schemes, `Security`, password-grant forms, background tasks, datetime/UUID/Enum encoding.
 <!-- PARITY:END -->
 
 ## Rust core (Phase 2)
@@ -256,18 +257,22 @@ Micro fast-paths (in-process, no servers):
 
 | Check | Baseline | fasterapi | Speedup |
 |---|---|---|---|
-| JSON `loads` | 0.0364s stdlib | 0.0642s SIMD | x0.57 |
-| JSON `dumps` | stdlib | Rust bridge | x0.92 |
-| Router match | 0.272s Python | 0.0835s `matchit` | x3.26 |
+| JSON `loads` | 0.0381s stdlib | 0.0648s SIMD | x0.59 |
+| JSON `dumps` | stdlib | Rust bridge | x0.89 |
+| Model validate (`loads`+`validate_python` vs `validate_json`) | 0.0047s | 0.002s | x2.33 |
+| Model dump (`dump_python`+`dumps` vs `dump_json`) | 0.006s | 0.0021s | x2.82 |
+| Router match | 0.2775s Python | 0.0841s `matchit` | x3.3 |
 
 Macro load (loopback, httpx concurrency; last full run):
 
-Run: `2026-09-18`, speedup **x1.048** (pre-push gate defaults to x1.0; strict 3x via `FASTERAPI_MIN_SPEEDUP=3.0`).
+Run: `2026-09-18`, speedup **x1.014** (pre-push gate defaults to x1.0; strict 3x via `FASTERAPI_MIN_SPEEDUP=3.0`).
 
 | Server | RPS | p50 | p90 | p99 | RSS |
 |---|---|---|---|---|---|
-| fastapi+uvicorn | 710.1 | 18.847ms | 50.723ms | 99.466ms | 52.9MB |
-| fasterapi | 744.1 | 17.895ms | 47.054ms | 100.721ms | 55.1MB |
+| fastapi+uvicorn | 762.6 | 43.247ms | 142.398ms | 262.807ms | 53.0MB |
+| fasterapi | 773.5 | 42.755ms | 139.713ms | 283.948ms | 55.5MB |
+
+POST /items (Pydantic validation path): fastapi+uvicorn 668.1 RPS vs fasterapi 672.9 RPS → **x1.007**.
 <!-- BENCH:END -->
 
 Design rule going forward: **as much as possible in Rust,

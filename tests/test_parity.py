@@ -372,6 +372,20 @@ def test_router_prefix_parity(fastapi_client, fasterapi_client):
     assert a.json() == b.json() == {"msg": "yo ada"}
 
 
+def test_docs_parity(fastapi_client, fasterapi_client):
+    for path in ["/docs", "/redoc", "/docs/oauth2-redirect"]:
+        a = fastapi_client.get(path)
+        b = fasterapi_client.get(path)
+        assert a.status_code == b.status_code == 200, path
+        assert a.text == b.text, path
+    # Disabled docs stay disabled on both sides
+    g_off = GFastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+    f_off = F.FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+    with GTestClient(g_off) as gc, F.TestClient(f_off) as fc:
+        for path in ["/docs", "/redoc", "/openapi.json"]:
+            assert gc.get(path).status_code == fc.get(path).status_code == 404, path
+
+
 def test_openapi_shapes():
     g = build_fastapi_app().openapi()
     f = build_fasterapi_app().openapi()

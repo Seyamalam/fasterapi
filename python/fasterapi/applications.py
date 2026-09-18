@@ -42,6 +42,8 @@ class FastAPI(Starlette):
         docs_url: Optional[str] = "/docs",
         redoc_url: Optional[str] = "/redoc",
         openapi_url: Optional[str] = "/openapi.json",
+        swagger_ui_oauth2_redirect_url: Optional[str] = "/docs/oauth2-redirect",
+        swagger_ui_parameters: Optional[dict[str, Any]] = None,
         **extra: Any,
     ) -> None:
         super().__init__(lifespan=lifespan, middleware=middleware)  # type: ignore[call-arg]
@@ -51,6 +53,8 @@ class FastAPI(Starlette):
         self.docs_url = docs_url
         self.redoc_url = redoc_url
         self.openapi_url = openapi_url
+        self.swagger_ui_oauth2_redirect_url = swagger_ui_oauth2_redirect_url
+        self.swagger_ui_parameters = swagger_ui_parameters
         self.default_response_class = default_response_class
         self.redirect_slashes = redirect_slashes
         self._router = APIRouter(dependencies=dependencies or [])
@@ -62,9 +66,8 @@ class FastAPI(Starlette):
 
     # -- internal wiring -----------------------------------------------------
     def _sync_starlette_routes(self) -> None:
-        # Rebuild Starlette route table from the APIRouter (idempotent).
-        self.router.routes = [r for r in self.router.routes if getattr(r, "_fasterapi_managed", False) is False and False]  # noqa
-        # Simpler: drop previously generated fasterapi routes, keep user middleware routes.
+        # Rebuild Starlette route table from the APIRouter (idempotent):
+        # drop previously generated fasterapi routes, keep the rest.
         self.router.routes = [r for r in self.router.routes if not getattr(r, "_fasterapi_owned", False)]
         for sr in self._router._starlette_routes():
             sr._fasterapi_owned = True  # type: ignore[attr-defined]
@@ -75,6 +78,46 @@ class FastAPI(Starlette):
                 return JSONResponse(self.openapi())
 
             r = StarletteRoute(self.openapi_url, _openapi, methods=["GET"], name="openapi")
+            r._fasterapi_owned = True  # type: ignore[attr-defined]
+            self.router.routes.append(r)
+        if self.docs_url:
+            from .openapi.docs import get_swagger_ui_html
+
+            docs_url, oauth2_url = self.docs_url, self.swagger_ui_oauth2_redirect_url
+            params = self.swagger_ui_parameters
+
+            async def _docs(_req: Request) -> Response:
+                return get_swagger_ui_html(
+                    openapi_url=self.openapi_url or "/openapi.json",
+                    title=f"{self.title} - Swagger UI",
+                    oauth2_redirect_url=oauth2_url,
+                    swagger_ui_parameters=params,
+                )
+
+            r = StarletteRoute(docs_url, _docs, methods=["GET"], name="docs")
+            r._fasterapi_owned = True  # type: ignore[attr-defined]
+            self.router.routes.append(r)
+        if self.redoc_url:
+            from .openapi.docs import get_redoc_html
+
+            redoc_url = self.redoc_url
+
+            async def _redoc(_req: Request) -> Response:
+                return get_redoc_html(openapi_url=self.openapi_url or "/openapi.json",
+                                      title=f"{self.title} - ReDoc")
+
+            r = StarletteRoute(redoc_url, _redoc, methods=["GET"], name="redoc")
+            r._fasterapi_owned = True  # type: ignore[attr-defined]
+            self.router.routes.append(r)
+        if self.swagger_ui_oauth2_redirect_url:
+            from .openapi.docs import get_swagger_ui_oauth2_redirect_html
+
+            redirect_url = self.swagger_ui_oauth2_redirect_url
+
+            async def _oauth2_redirect(_req: Request) -> Response:
+                return get_swagger_ui_oauth2_redirect_html()
+
+            r = StarletteRoute(redirect_url, _oauth2_redirect, methods=["GET"], name="oauth2-redirect")
             r._fasterapi_owned = True  # type: ignore[attr-defined]
             self.router.routes.append(r)
 

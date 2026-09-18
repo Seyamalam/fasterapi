@@ -12,6 +12,7 @@ from __future__ import annotations
 import inspect
 import json as _stdlib_json
 import sys
+import weakref
 from contextlib import AsyncExitStack
 from typing import Any, Callable, Coroutine, Optional, Union, get_origin
 
@@ -43,7 +44,30 @@ def _is_pydantic_model(tp: Any) -> bool:
         return False
 
 
-_HINTS_CACHE: dict[int, dict[str, Any]] = {}
+_HINTS_CACHE: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+_SIG_CACHE: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def _signature(fn: Callable[..., Any]) -> inspect.Signature | None:
+    """Per-process cached signature (hot request path must not re-inspect).
+
+    Weak keys: ``id()``-keyed caches would collide after garbage collection
+    and serve one endpoint's signature to another.
+    """
+    try:
+        sig = _SIG_CACHE.get(fn)
+    except TypeError:
+        sig = None
+    if sig is None:
+        try:
+            sig = inspect.signature(fn)
+        except (TypeError, ValueError):
+            return None
+        try:
+            _SIG_CACHE[fn] = sig
+        except TypeError:
+            pass
+    return sig
 
 
 def _resolved_hints(fn: Callable[..., Any]) -> dict[str, Any]:
@@ -52,14 +76,20 @@ def _resolved_hints(fn: Callable[..., Any]) -> dict[str, Any]:
     Falls back to raw signature annotations when hints cannot be evaluated
     (e.g. locally-defined models inside test functions).
     """
-    key = id(fn)
-    if key in _HINTS_CACHE:
-        return _HINTS_CACHE[key]
+    try:
+        hints = _HINTS_CACHE.get(fn)  # type: ignore[arg-type]
+    except TypeError:
+        hints = None
+    if hints is not None:
+        return hints
     try:
         import typing
 
         hints = typing.get_type_hints(fn, include_extras=True)
-        _HINTS_CACHE[key] = hints
+        try:
+            _HINTS_CACHE[fn] = hints  # type: ignore[index]
+        except TypeError:
+            pass
         return hints
     except Exception:
         return {}
@@ -310,9 +340,8 @@ async def _solve_fn_kwargs(
     body_raw: Optional[bytes] = None,
 ) -> dict[str, Any]:
     """Resolve kwargs for an endpoint *or* a dependency (recursive)."""
-    try:
-        sig = inspect.signature(fn)
-    except (TypeError, ValueError):
+    sig = _signature(fn)
+    if sig is None:
         return {}
     kwargs: dict[str, Any] = {}
     errors: list[dict[str, Any]] = []
@@ -583,26 +612,36 @@ def _resolve_body_param(
     # JSON body
     embed = bool(meta.embed) if meta else False
     alias = (meta.alias if meta else None) or pname
-    if body_json is None:
-        if body_raw:
-            # Bytes arrived but unparseable -> malformed JSON (FastAPI: json_invalid).
-            return None, _json_invalid_error(body_raw)
-        # No JSON payload at all.
-        has_default = False
-        dflt = None
-        if meta is not None and meta.has_default() and meta.default is not Ellipsis:
-            has_default, dflt = True, meta.default
-        if has_default:
-            return dflt, no
-        # Optional[X] (default None in signature handled by caller); here required.
-        return None, [_missing(["body", alias if embed else pname])]
     # Fast path: single Pydantic model takes the whole raw payload through
     # `validate_json` — one Rust pass (parse + validate), no intermediate dict.
     if _is_pydantic_model(ann) and not embed and body_raw:
         try:
             return _adapter(ann).validate_json(body_raw), no
         except Exception as exc:
-            return None, _pydantic_errors(exc, ["body"], body_json)
+            get_errs = getattr(exc, "errors", None)
+            first_type = get_errs()[0].get("type") if callable(get_errs) and get_errs() else None
+            if first_type == "json_invalid":
+                # Normalize pydantic's raw-bytes error to FastAPI's shape.
+                return None, _json_invalid_error(body_raw)
+            return None, _pydantic_errors(exc, ["body"], body_raw.decode("utf-8", "replace"))
+    if body_json is None:
+        if body_raw:
+            # Bytes arrived but no parsed view yet: parse on first real use
+            # (cached on request.state), or report malformed JSON like FastAPI.
+            try:
+                body_json = _parsed_json_cached(request, body_raw)
+            except _InvalidJson:
+                return None, _json_invalid_error(body_raw)
+        else:
+            # No JSON payload at all.
+            has_default = False
+            dflt = None
+            if meta is not None and meta.has_default() and meta.default is not Ellipsis:
+                has_default, dflt = True, meta.default
+            if has_default:
+                return dflt, no
+            # Optional[X] (default None in signature handled by caller); here required.
+            return None, [_missing(["body", alias if embed else pname])]
     payload = body_json.get(alias, body_json.get(pname, _MISSING)) if isinstance(body_json, dict) and embed else (
         body_json.get(pname, body_json) if isinstance(body_json, dict) and meta is None and not _is_pydantic_model(ann) and pname in body_json
         else body_json if _is_pydantic_model(ann) or meta is None or not embed else body_json.get(alias, _MISSING)
@@ -624,6 +663,40 @@ def _resolve_body_param(
 
 
 _MISSING: Any = object()
+
+
+class _InvalidJson(Exception):
+    """Internal: cached body bytes are not valid JSON."""
+
+
+def _parsed_json_cached(request: Request, body_raw: bytes) -> Any:
+    """Parse body bytes once per request (request.state cache).
+
+    Raises `_InvalidJson` when malformed so callers mirror FastAPI's
+    `json_invalid` 422. The single-model fast path never calls this.
+    """
+    state = getattr(request, "state", None)
+    if state is not None and hasattr(state, "_fa_body"):
+        cached = getattr(state, "_fa_body")
+        if isinstance(cached, _InvalidJson):
+            raise cached
+        return cached
+    try:
+        parsed = _bridge.fast_json_loads(body_raw.decode("utf-8"))
+    except Exception as exc:
+        err = _InvalidJson(str(exc))
+        if state is not None:
+            try:
+                setattr(state, "_fa_body", err)
+            except Exception:
+                pass
+        raise err
+    if state is not None:
+        try:
+            setattr(state, "_fa_body", parsed)
+        except Exception:
+            pass
+    return parsed
 
 
 # ----------------------------------------------------------------- routes ---
@@ -689,7 +762,8 @@ def _make_http_handler(route: _RouteDef, router_deps: list[Depends]) -> Callable
         query = dict(request.query_params)
         headers = {k.lower(): v for k, v in request.headers.items()}
         cookies = dict(request.cookies)
-        # Body: keep raw bytes (validate_json fast path) + parsed views.
+        # Body: keep raw bytes only. The single-model fast path validates
+        # straight from bytes; anything else parses lazily (cached) on use.
         body_raw: Optional[bytes] = None
         body_json: Any = None
         form: Optional[dict[str, Any]] = None
@@ -700,12 +774,8 @@ def _make_http_handler(route: _RouteDef, router_deps: list[Depends]) -> Callable
                     raw = await request.body()
                     if raw:
                         body_raw = bytes(raw)
-                        try:
-                            body_json = _bridge.fast_json_loads(raw.decode("utf-8"))
-                        except Exception:
-                            body_json = None
                 except Exception:
-                    body_raw, body_json = None, None
+                    body_raw = None
             elif "multipart/form-data" in ctype or "application/x-www-form-urlencoded" in ctype:
                 try:
                     f = await request.form()

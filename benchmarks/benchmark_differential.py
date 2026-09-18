@@ -130,7 +130,8 @@ def proc_stats(proc: subprocess.Popen) -> dict:
         return {"cpu_pct": 0.0, "rss_bytes": rss, "children_rss": 0}
 
 
-async def httpx_load(url: str, requests: int, concurrency: int) -> list[float]:
+async def httpx_load(url: str, requests: int, concurrency: int,
+                     method: str = "GET", json_body: "dict | None" = None) -> list[float]:
     import httpx
 
     lat: list[float] = []
@@ -139,7 +140,10 @@ async def httpx_load(url: str, requests: int, concurrency: int) -> list[float]:
         async def one() -> None:
             async with sem:
                 t0 = time.perf_counter()
-                r = await client.get(url)
+                if method == "POST":
+                    r = await client.post(url, json=json_body)
+                else:
+                    r = await client.get(url)
                 assert r.status_code == 200
                 lat.append((time.perf_counter() - t0) * 1000)
 
@@ -242,13 +246,52 @@ def micro_benchmarks() -> dict:
     def speedup(std: float, fast: float) -> float:
         return round(std / fast, 2) if fast > 0 else 1.0
 
+    # --- Pydantic model validation: FastAPI-style (loads + validate_python)
+    # --- vs fasterapi-style single-pass validate_json (pydantic-core Rust).
+    from pydantic import BaseModel, TypeAdapter
+
+    class _Item(BaseModel):
+        name: str
+        price: float
+        tags: list[str] = []
+
+    _TA = TypeAdapter(_Item)
+    model_obj = {"name": "widget", "price": 9.5, "tags": ["a", "b"]}
+    model_str = _stdlib.dumps(model_obj)
+    model_bytes = model_str.encode()
+    M = 3000
+    t0 = time.perf_counter()
+    for _ in range(M):
+        _TA.validate_python(_stdlib.loads(model_str))
+    style_validate = time.perf_counter() - t0
+    t0 = time.perf_counter()
+    for _ in range(M):
+        _TA.validate_json(model_bytes)
+    fast_validate = time.perf_counter() - t0
+    # --- Response serialization: dump_python + dumps vs single-pass dump_json.
+    inst = _TA.validate_python(model_obj)
+    t0 = time.perf_counter()
+    for _ in range(M):
+        _stdlib.dumps(_TA.dump_python(inst, mode="json"))
+    style_dump = time.perf_counter() - t0
+    t0 = time.perf_counter()
+    for _ in range(M):
+        _TA.dump_json(inst)
+    fast_dump_model = time.perf_counter() - t0
+
     return {
         "has_rust": bridge.HAS_RUST,
         "json_loads_speedup": speedup(std_load, fast_load),
         "json_dumps_speedup": speedup(std_dump, fast_dump),
         "router_match_speedup": round(route_speedup, 2),
+        "model_validate_speedup": speedup(style_validate, fast_validate),
+        "model_dump_speedup": speedup(style_dump, fast_dump_model),
         "json_std_load_s": round(std_load, 4),
         "json_fast_load_s": round(fast_load, 4),
+        "model_classic_s": round(style_validate, 4),
+        "model_validate_json_s": round(fast_validate, 4),
+        "model_classic_dump_s": round(style_dump, 4),
+        "model_dump_json_s": round(fast_dump_model, 4),
         "router_py_s": round(py_route, 4) if bridge.HAS_RUST else None,
         "router_rs_s": round(rust_route, 4) if bridge.HAS_RUST else None,
     }
@@ -273,6 +316,8 @@ def main() -> int:
     print(f"[micro] has_rust={micro['has_rust']} "
           f"json_loads x{micro['json_loads_speedup']} "
           f"json_dumps x{micro['json_dumps_speedup']} "
+          f"model_validate x{micro['model_validate_speedup']} "
+          f"model_dump x{micro['model_dump_speedup']} "
           f"router x{micro['router_match_speedup']}")
 
     result: dict = {"micro": micro, "macro": None}
@@ -310,6 +355,28 @@ def main() -> int:
                     result["macro"] = {}
                 result["macro"][label] = summary
 
+            # POST /items phase (Pydantic validation fast path end-to-end).
+            # Quick-gate mode stays GET-only to keep pushes fast.
+            if not args.quick:
+                item = {"name": "widget", "price": 9.5, "tags": ["a", "b"]}
+                for label, port in (("fastapi+uvicorn", FASTAPI_PORT), ("fasterapi", FASTERAPI_PORT)):
+                    url = f"http://127.0.0.1:{port}/items"
+                    t0 = time.perf_counter()
+                    lat = asyncio.run(httpx_load(url, args.requests, args.concurrency,
+                                                 method="POST", json_body=item))
+                    elapsed = time.perf_counter() - t0
+                    summary = summarize(lat, elapsed)
+                    proc = p1 if label.startswith("fastapi+") else p2
+                    summary.update(proc_stats(proc))
+                    summary["label"] = label + " (POST /items)"
+                    print(f"[{label} POST /items] RPS={summary['rps']} "
+                          f"p50={summary['p50_ms']}ms p90={summary['p90_ms']}ms p99={summary['p99_ms']}ms")
+                    result["macro"][label + " (POST /items)"] = summary
+                post_a = result["macro"]["fastapi+uvicorn (POST /items)"]["rps"] or 1.0
+                post_b = result["macro"]["fasterapi (POST /items)"]["rps"]
+                result["post_speedup_rps"] = round(post_b / post_a, 3)
+                print(f"[result] POST /items speedup: x{post_b / post_a:.2f}")
+
             macro = result["macro"]
             rps_a = macro["fastapi+uvicorn"]["rps"] or 1.0
             rps_b = macro["fasterapi"]["rps"]
@@ -333,9 +400,10 @@ def main() -> int:
                     except Exception:
                         p.kill()
     else:
-        # Micro gate: enforce JSON/router fast-path threshold.
+        # Micro gate: enforce fast-path threshold over every measured check.
         need = args.min_speedup
-        got = max(micro["json_loads_speedup"], micro["router_match_speedup"])
+        got = max(micro["json_loads_speedup"], micro["router_match_speedup"],
+                  micro["model_validate_speedup"], micro["model_dump_speedup"])
         print(f"[result] micro max speedup x{got} (gate x{need}, has_rust={micro['has_rust']})")
         if micro["has_rust"] and got < need:
             print(f"PERF GATE FAILED (micro): x{got} < x{need}", file=sys.stderr)

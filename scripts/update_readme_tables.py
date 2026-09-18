@@ -33,7 +33,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 README = ROOT / "README.md"
 MACRO_JSON = ROOT / "benchmark-results" / "differential-latest.json"
-PARITY_FILES = ["tests/test_parity.py", "tests/test_fasterapi_native.py"]
+PARITY_FILES = ["tests/test_parity.py", "tests/test_fasterapi_native.py", "tests/test_parity_security.py"]
 
 PARITY_START = "<!-- PARITY:START -->"
 PARITY_END = "<!-- PARITY:END -->"
@@ -128,6 +128,8 @@ def render_parity(passed: int, failed: int) -> str:
     rows = [
         f"| Differential (`tests/test_parity.py`, FastAPI vs fasterapi) | {totals[PARITY_FILES[0]]} | "
         + ("all passing" if failed == 0 else f"see run ({failed} failing)") + " |",
+        f"| Auth/background/encoders (`tests/test_parity_security.py`) | {totals[PARITY_FILES[2]]} | "
+        + ("all passing" if failed == 0 else f"see run ({failed} failing)") + " |",
         f"| Native (`tests/test_fasterapi_native.py`) | {totals[PARITY_FILES[1]]} | "
         + ("all passing" if failed == 0 else f"see run ({failed} failing)") + " |",
         f"| **Total** | **{total}** | **{passed} passed{f', {failed} failed' if failed else ''}** |",
@@ -141,9 +143,12 @@ def render_parity(passed: int, failed: int) -> str:
         *rows,
         "",
         "Coverage: ping, path/query/header/cookie params, validation shapes "
-        "(422 `loc`/`type`), JSON body + `response_model`, Form, file upload, "
-        "DI order + `yield` teardown, `HTTPException`, custom handlers, router "
-        "prefixes, OpenAPI shapes, websockets, guards, DAG, Rust bridge.",
+        "(422 `loc`/`type`/`ctx`, multi-error, malformed-JSON `json_invalid`), "
+        "JSON body + `response_model`, Form, file upload, DI order + `yield` "
+        "teardown, `HTTPException`, custom handlers, router prefixes, OpenAPI "
+        "shapes, websockets, guards, DAG, Rust bridge, OAuth2/HTTP/API-key "
+        "schemes, `Security`, password-grant forms, background tasks, "
+        "datetime/UUID/Enum encoding.",
         PARITY_END,
     ])
 
@@ -160,6 +165,10 @@ def render_bench(micro: dict, macro: dict | None, has_rust: bool) -> str:
         "|---|---|---|---|",
         f"| JSON `loads` | {micro['json_std_load_s']}s stdlib | {micro['json_fast_load_s']}s SIMD | x{micro['json_loads_speedup']} |",
         f"| JSON `dumps` | stdlib | Rust bridge | x{micro['json_dumps_speedup']} |",
+        f"| Model validate (`loads`+`validate_python` vs `validate_json`) | "
+        f"{micro['model_classic_s']}s | {micro['model_validate_json_s']}s | x{micro['model_validate_speedup']} |",
+        f"| Model dump (`dump_python`+`dumps` vs `dump_json`) | "
+        f"{micro['model_classic_dump_s']}s | {micro['model_dump_json_s']}s | x{micro['model_dump_speedup']} |",
     ]
     if has_rust:
         lines.append(
@@ -188,6 +197,14 @@ def render_bench(micro: dict, macro: dict | None, has_rust: bool) -> str:
             f"| fasterapi | {b.get('rps', '?')} | {b.get('p50_ms', '?')}ms | "
             f"{b.get('p90_ms', '?')}ms | {b.get('p99_ms', '?')}ms | {_mb(b.get('rss_bytes', 0))} |",
         ]
+        pa = m.get("fastapi+uvicorn (POST /items)")
+        pb = m.get("fasterapi (POST /items)")
+        if pa and pb:
+            lines += [
+                "",
+                f"POST /items (Pydantic validation path): fastapi+uvicorn {pa.get('rps', '?')} RPS vs "
+                f"fasterapi {pb.get('rps', '?')} RPS → **x{macro.get('post_speedup_rps', '?')}**.",
+            ]
     else:
         lines.append("No full run yet — `python benchmarks/benchmark_differential.py --quick` "
                      "writes `benchmark-results/differential-latest.json`, then re-run this script.")
