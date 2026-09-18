@@ -526,12 +526,17 @@ async def _solve_fn_kwargs(
             continue
 
         # --- Bare dict/list without marker -> body (FastAPI rule) --------------
-        # `payload: dict` takes the whole JSON body; `payload: list` (and
-        # tuple/set) is embedded by field name, exactly like FastAPI.
-        if ann in (dict, list, tuple, set, frozenset) and default is inspect.Parameter.empty:
+        # `payload: dict` (or any subscripted container like `list[Item]`)
+        # takes the whole JSON body. A bare `list`/`tuple`/`set` without a
+        # `Body()` marker is unsatisfiable via JSON (FastAPI 422s too).
+        _origin = get_origin(ann)
+        if (ann in (dict, list, tuple, set, frozenset) or _origin in (dict, list, tuple, set, frozenset)) \
+                and default is inspect.Parameter.empty:
+            if ann in (list, tuple, set, frozenset):
+                errors.extend(_missing(["body", pname]))
+                continue
             val, errs = _resolve_body_param(
                 pname, ann, None, body_json, form, request, body_raw,
-                force_embed=ann is not dict,
             )
             if errs:
                 errors.extend(errs)
@@ -565,6 +570,17 @@ async def _solve_fn_kwargs(
     if errors:
         raise RequestValidationError(errors)
     return kwargs
+
+
+def _json_body_type(ann: Any) -> bool:
+    """Annotations safe for single-pass `validate_json` (models + containers)."""
+    if ann is inspect.Parameter.empty or ann is Any:
+        return False
+    if _is_pydantic_model(ann):
+        return True
+    if ann in (dict, list):
+        return True
+    return get_origin(ann) in (dict, list, tuple, set, frozenset)
 
 
 def _pydantic_errors(exc: Exception, loc_prefix: list[str], payload: Any) -> list[dict[str, Any]]:
@@ -605,7 +621,6 @@ def _resolve_body_param(
     form: Optional[dict[str, Any]],
     request: Request,
     body_raw: Optional[bytes] = None,
-    force_embed: bool = False,
 ) -> tuple[Any, list[dict[str, Any]]]:
     no: list[dict[str, Any]] = []
     # File / UploadFile
@@ -635,11 +650,11 @@ def _resolve_body_param(
         return None, [_missing(["body", alias])]
 
     # JSON body
-    embed = force_embed or bool(meta.embed) if meta else force_embed
+    embed = bool(meta.embed) if meta else False
     alias = (meta.alias if meta else None) or pname
-    # Fast path: single Pydantic model takes the whole raw payload through
+    # Fast path: single JSON-shaped body takes the whole raw payload through
     # `validate_json` — one Rust pass (parse + validate), no intermediate dict.
-    if _is_pydantic_model(ann) and not embed and body_raw:
+    if _json_body_type(ann) and not embed and body_raw:
         try:
             return _adapter(ann).validate_json(body_raw), no
         except Exception as exc:
@@ -667,13 +682,19 @@ def _resolve_body_param(
                 return dflt, no
             # Optional[X] (default None in signature handled by caller); here required.
             return None, [_missing(["body", alias if embed else pname])]
-    payload = body_json.get(alias, body_json.get(pname, _MISSING)) if isinstance(body_json, dict) and embed else (
-        body_json.get(pname, body_json) if isinstance(body_json, dict) and meta is None and not _is_pydantic_model(ann) and pname in body_json
-        else body_json if _is_pydantic_model(ann) or meta is None or not embed else body_json.get(alias, _MISSING)
-    )
-    # Simplify: single-model body takes the whole payload.
-    if _is_pydantic_model(ann) and not embed:
+    if embed:
+        # Embedded field: only a JSON object carrying the name qualifies.
+        if isinstance(body_json, dict) and (alias in body_json or pname in body_json):
+            payload = body_json.get(alias, body_json.get(pname))
+        else:
+            payload = _MISSING
+    elif _is_pydantic_model(ann) or meta is None:
+        # Single model (or unmarked) body takes the whole payload.
         payload = body_json
+    elif isinstance(body_json, dict):
+        payload = body_json.get(alias, _MISSING)
+    else:
+        payload = _MISSING
     if payload is _MISSING:
         if meta is not None and meta.has_default() and meta.default is not Ellipsis:
             return meta.default, no

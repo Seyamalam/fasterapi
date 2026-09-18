@@ -61,6 +61,10 @@ async def read_item(item_id: int, q: str | None = None, limit: int = 10):
 @app.post("/items")
 async def create_item(item: Item):
     return item.model_dump()
+
+@app.post("/bulk")
+async def create_bulk(items: list[Item]):
+    return {{"count": len(items)}}
 """
 
 
@@ -317,6 +321,8 @@ def main() -> int:
     ap.add_argument("--endpoint", type=str, default="/ping")
     ap.add_argument("--fasterapi-server", choices=["uvicorn", "hyper"], default="hyper",
                     help="host for the fasterapi side (default: hyper Rust host)")
+    ap.add_argument("--bulk-items", type=int, default=0,
+                    help="bulk phase: POST N items to /bulk (0 = skip; matrix uses 50)")
     args = ap.parse_args()
 
     if args.quick:
@@ -388,17 +394,51 @@ def main() -> int:
                 result["post_speedup_rps"] = round(post_b / post_a, 3)
                 print(f"[result] POST /items speedup: x{post_b / post_a:.2f}")
 
+            # Bulk phase: N-item list payloads (validation-heavy end-to-end).
+            if not args.quick and args.bulk_items > 0:
+                bulk = [{"name": f"item-{i}", "price": 1.5 * (i + 1), "tags": ["a", "b"]}
+                        for i in range(args.bulk_items)]
+                for label, port in (("fastapi+uvicorn", FASTAPI_PORT), ("fasterapi", FASTERAPI_PORT)):
+                    url = f"http://127.0.0.1:{port}/bulk"
+                    t0 = time.perf_counter()
+                    lat = asyncio.run(httpx_load(url, args.requests, args.concurrency,
+                                                 method="POST", json_body=bulk))
+                    elapsed = time.perf_counter() - t0
+                    summary = summarize(lat, elapsed)
+                    proc = p1 if label.startswith("fastapi+") else p2
+                    summary.update(proc_stats(proc))
+                    summary["label"] = label + f" (POST /bulk x{args.bulk_items})"
+                    print(f"[{label} POST /bulk x{args.bulk_items}] RPS={summary['rps']} "
+                          f"p50={summary['p50_ms']}ms p90={summary['p90_ms']}ms p99={summary['p99_ms']}ms")
+                    result["macro"][label + f" (POST /bulk x{args.bulk_items})"] = summary
+                bulk_a = result["macro"][f"fastapi+uvicorn (POST /bulk x{args.bulk_items})"]["rps"] or 1.0
+                bulk_b = result["macro"][f"fasterapi (POST /bulk x{args.bulk_items})"]["rps"]
+                result["bulk_speedup_rps"] = round(bulk_b / bulk_a, 3)
+                print(f"[result] POST /bulk x{args.bulk_items} speedup: x{bulk_b / bulk_a:.2f}")
+
             macro = result["macro"]
             rps_a = macro["fastapi+uvicorn"]["rps"] or 1.0
             rps_b = macro["fasterapi"]["rps"]
             speedup = rps_b / rps_a
             result["speedup_rps"] = round(speedup, 3)
+            result["requests"] = args.requests
+            result["concurrency"] = args.concurrency
+            result["bulk_items"] = args.bulk_items
             print(f"[result] fasterapi vs fastapi RPS speedup: x{speedup:.2f} "
                   f"(gate: x{args.min_speedup})")
             out = args.json_out or str(Path("benchmark-results") / "differential-latest.json")
             Path(out).parent.mkdir(parents=True, exist_ok=True)
             Path(out).write_text(json.dumps(result, indent=2))
             print(f"[result] wrote {out}")
+            # Local history trail (gitignored): every full run appends a copy.
+            try:
+                hist = Path("benchmark-results") / "history"
+                hist.mkdir(parents=True, exist_ok=True)
+                stamp = time.strftime("%Y%m%d-%H%M%S")
+                (hist / f"{stamp}-{result['fasterapi_server']}-x{speedup:.2f}.json").write_text(
+                    json.dumps(result, indent=2))
+            except Exception as exc:
+                print(f"[result] history append skipped: {exc}")
             if speedup < args.min_speedup:
                 print(f"PERF GATE FAILED: x{speedup:.2f} < x{args.min_speedup}", file=sys.stderr)
                 return 2

@@ -214,6 +214,14 @@ def render_bench(micro: dict, macro: dict | None, has_rust: bool) -> str:
                 f"POST /items (Pydantic validation path): fastapi+uvicorn {pa.get('rps', '?')} RPS vs "
                 f"fasterapi {pb.get('rps', '?')} RPS → **x{macro.get('post_speedup_rps', '?')}**.",
             ]
+        bulk_n = macro.get("bulk_items", 0) or 0
+        ba = m.get(f"fastapi+uvicorn (POST /bulk x{bulk_n})") if bulk_n else None
+        bb = m.get(f"fasterapi (POST /bulk x{bulk_n})") if bulk_n else None
+        if ba and bb:
+            lines += [
+                f"POST /bulk x{bulk_n} (validation-heavy): fastapi+uvicorn {ba.get('rps', '?')} RPS vs "
+                f"fasterapi {bb.get('rps', '?')} RPS → **x{macro.get('bulk_speedup_rps', '?')}**.",
+            ]
     else:
         lines.append("No full run yet — `python benchmarks/benchmark_differential.py --quick` "
                      "writes `benchmark-results/differential-latest.json`, then re-run this script.")

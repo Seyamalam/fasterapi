@@ -290,6 +290,37 @@ def test_body_create_parity(fastapi_client, fasterapi_client):
     assert b.json()["id"] == 42
 
 
+def test_bare_collection_bodies():
+    def build(cls):  # type: ignore[no-untyped-def]
+        app = cls()
+
+        @app.post("/d")
+        async def d(payload: dict):
+            return {"keys": sorted(payload)}
+
+        @app.post("/l")
+        async def l(payload: list):
+            return {"n": len(payload)}
+
+        @app.post("/bulk")
+        async def bulk(items: list[Item]):
+            return {"count": len(items)}
+
+        return app
+
+    from fastapi.testclient import TestClient as _GT
+    with _GT(build(GFastAPI)) as gc, F.TestClient(build(F.FastAPI)) as fc:
+        a, b = gc.post("/d", json={"x": 1}), fc.post("/d", json={"x": 1})
+        assert (a.status_code, a.json()) == (b.status_code, b.json()) == (200, {"keys": ["x"]})
+        a, b = gc.post("/l", json=[1, 2]), fc.post("/l", json=[1, 2])
+        assert a.status_code == b.status_code == 422
+        a, b = gc.post("/l", json={"payload": [1, 2]}), fc.post("/l", json={"payload": [1, 2]})
+        assert a.status_code == b.status_code == 422
+        bulk = [{"name": f"i{i}", "price": 1.0} for i in range(5)]
+        a, b = gc.post("/bulk", json=bulk), fc.post("/bulk", json=bulk)
+        assert (a.status_code, a.json()) == (b.status_code, b.json()) == (200, {"count": 5})
+
+
 def test_return_annotation_response_model():
     def build(cls):  # type: ignore[no-untyped-def]
         app = cls()
