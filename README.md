@@ -123,7 +123,8 @@ pytest tests/ -q
 | Auth/background/encoders (`tests/test_parity_security.py`) | 8 | all passing |
 | SSE/docs-adjacent (`tests/test_parity_surface.py`) | 7 | all passing |
 | Export guard (`tests/test_exports.py`) | 2 | all passing |
-| **Total** | **43** | **43 passed** |
+| Thread soak (`tests/test_threads.py`) | 3 | all passing |
+| **Total** | **46** | **46 passed** |
 
 Coverage: ping, path/query/header/cookie params, validation shapes (422 `loc`/`type`/`ctx`, multi-error, malformed-JSON `json_invalid`), JSON body + `response_model`, Form, file upload, DI order + `yield` teardown, `HTTPException`, custom handlers, router prefixes, OpenAPI shapes, websockets, guards, DAG, Rust bridge, OAuth2/HTTP/API-key schemes, `Security`, password-grant forms, background tasks, datetime/UUID/Enum encoding.
 <!-- PARITY:END -->
@@ -259,11 +260,11 @@ Micro fast-paths (in-process, no servers):
 
 | Check | Baseline | fasterapi | Speedup |
 |---|---|---|---|
-| JSON `loads` | 0.0401s stdlib | 0.0668s SIMD | x0.6 |
-| JSON `dumps` | stdlib | Rust bridge | x1.09 |
-| Model validate (`loads`+`validate_python` vs `validate_json`) | 0.0048s | 0.0021s | x2.25 |
-| Model dump (`dump_python`+`dumps` vs `dump_json`) | 0.0061s | 0.0021s | x2.96 |
-| Router match | 0.284s Python | 0.0906s `matchit` | x3.13 |
+| JSON `loads` | 0.0385s stdlib | 0.066s SIMD | x0.58 |
+| JSON `dumps` | stdlib | Rust bridge | x1.03 |
+| Model validate (`loads`+`validate_python` vs `validate_json`) | 0.0049s | 0.0022s | x2.25 |
+| Model dump (`dump_python`+`dumps` vs `dump_json`) | 0.0063s | 0.0021s | x3.0 |
+| Router match | 0.2882s Python | 0.086s `matchit` | x3.35 |
 
 Macro load (loopback, httpx concurrency; last full run):
 

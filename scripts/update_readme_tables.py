@@ -34,12 +34,13 @@ ROOT = Path(__file__).resolve().parents[1]
 README = ROOT / "README.md"
 MACRO_JSON = ROOT / "benchmark-results" / "differential-latest.json"
 PARITY_FILES = ["tests/test_parity.py", "tests/test_fasterapi_native.py", "tests/test_parity_security.py",
-                "tests/test_parity_surface.py", "tests/test_exports.py"]
+                "tests/test_parity_surface.py", "tests/test_exports.py", "tests/test_threads.py"]
 PARITY_LABELS = {
     "tests/test_parity.py": "Differential (`tests/test_parity.py`, FastAPI vs fasterapi)",
     "tests/test_parity_security.py": "Auth/background/encoders (`tests/test_parity_security.py`)",
     "tests/test_parity_surface.py": "SSE/docs-adjacent (`tests/test_parity_surface.py`)",
     "tests/test_exports.py": "Export guard (`tests/test_exports.py`)",
+    "tests/test_threads.py": "Thread soak (`tests/test_threads.py`)",
     "tests/test_fasterapi_native.py": "Native (`tests/test_fasterapi_native.py`)",
 }
 
