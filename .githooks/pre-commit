@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# .githooks/pre-commit — fast local checks (no network, no servers).
+set -euo pipefail
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+PY="${FASTERAPI_PY:-python3}"
+
+echo "=== fasterapi pre-commit ==="
+# Rust formatting (advisory — never blocks when toolchain is busy)
+if command -v cargo >/dev/null 2>&1; then
+  cargo fmt --check 2>/dev/null || echo "  (cargo fmt: differences found — run 'cargo fmt')"
+fi
+# Fast native unit tests only; full differential suite runs on pre-push.
+"$PY" -m pytest tests/test_fasterapi_native.py -q
+echo "=== pre-commit OK ==="
