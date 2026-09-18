@@ -24,7 +24,7 @@ regex = "1"
 percent-encoding = "2"
 # Hyper host spike (tasks: Rust owns sockets + HTTP parsing, Python runs the
 # ASGI app in-process). Minimal features only.
-tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time", "signal", "sync"] }
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["server", "tokio"] }
 http-body-util = "0.1"

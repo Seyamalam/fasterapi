@@ -290,6 +290,34 @@ def test_body_create_parity(fastapi_client, fasterapi_client):
     assert b.json()["id"] == 42
 
 
+def test_return_annotation_response_model():
+    def build(cls):  # type: ignore[no-untyped-def]
+        app = cls()
+
+        @app.get("/a")
+        async def a() -> Item:
+            return {"name": "x", "price": 1.5, "zzz": "dropped"}
+
+        @app.get("/b", response_model=None)
+        async def b() -> Item:
+            return {"name": "x", "price": 1.5, "zzz": "kept"}
+
+        @app.get("/c")
+        async def c() -> list[Item]:
+            return [{"name": "x", "price": 1.5, "zzz": "dropped"}]
+
+        return app
+
+    from fastapi.testclient import TestClient as _GT
+    with _GT(build(GFastAPI)) as gc, F.TestClient(build(F.FastAPI)) as fc:
+        for path, expected in [("/a", {"name": "x", "price": 1.5, "tags": []}),
+                               ("/b", {"name": "x", "price": 1.5, "zzz": "kept"}),
+                               ("/c", [{"name": "x", "price": 1.5, "tags": []}])]:
+            a, b = gc.get(path), fc.get(path)
+            assert a.status_code == b.status_code == 200, path
+            assert a.json() == b.json() == expected, path
+
+
 def test_response_model_flags_parity():
     from pydantic import BaseModel as _BM
 

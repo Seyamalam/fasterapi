@@ -883,9 +883,92 @@ use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 
 const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+/// Per-worker queue depth: backpressure overflows to `spawn_blocking`.
+const POOL_QUEUE: usize = 64;
 
 fn py_runtime_error(msg: impl ToString) -> pyo3::PyErr {
     pyo3::exceptions::PyRuntimeError::new_err(msg.to_string())
+}
+
+/// One Python job: everything needed to drive a single ASGI request.
+struct PyJob {
+    app: PyObject,
+    method: String,
+    path: String,
+    query: String,
+    headers: Vec<(String, Vec<u8>)>,
+    body: Vec<u8>,
+    reply: tokio::sync::oneshot::Sender<Result<(u16, Vec<(String, String)>, Vec<u8>), String>>,
+}
+
+fn run_py_job(job: PyJob) {
+    let result = Python::with_gil(|py| {
+        use pyo3::types::PyBytes;
+        // NOTE: Vec<u8> wouldcross as list[int]; HTTP needs real bytes.
+        let py_headers: Vec<(String, PyObject)> = job
+            .headers
+            .iter()
+            .map(|(k, v)| (k.clone(), PyBytes::new_bound(py, v).into_any().unbind()))
+            .collect();
+        let py_body = PyBytes::new_bound(py, &job.body).into_any().unbind();
+        let helper = py
+            .import_bound("fasterapi._hyper_serve")
+            .map_err(|e| e.to_string())?;
+        let ret = helper
+            .getattr("run_request")
+            .map_err(|e| e.to_string())?
+            .call1((job.app, job.method, job.path, job.query, py_headers, py_body))
+            .map_err(|e| e.to_string())?;
+        ret.extract::<(u16, Vec<(String, String)>, Vec<u8>)>()
+            .map_err(|e| e.to_string())
+    });
+    let _ = job.reply.send(result);
+}
+
+/// Fixed pool of Python worker threads (one thread-local asyncio loop each).
+///
+/// Unbounded `spawn_blocking` fans every concurrent request onto its own OS
+/// thread; on GIL builds those threads just contend. A CPU-count pool keeps
+/// the GIL handoff tight (backpressure overflows to `spawn_blocking`).
+struct PyWorkerPool {
+    senders: Vec<std::sync::mpsc::SyncSender<PyJob>>,
+    next: std::sync::atomic::AtomicUsize,
+}
+
+impl PyWorkerPool {
+    fn new(n: usize) -> Self {
+        let n = n.max(1);
+        let mut senders = Vec::with_capacity(n);
+        for _ in 0..n {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<PyJob>(POOL_QUEUE);
+            senders.push(tx);
+            std::thread::Builder::new()
+                .name("fasterapi-py".to_string())
+                .spawn(move || {
+                    while let Ok(job) = rx.recv() {
+                        run_py_job(job);
+                    }
+                })
+                .expect("spawn fasterapi python worker");
+        }
+        Self {
+            senders,
+            next: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn dispatch(&self, job: PyJob) -> Result<(), PyJob> {
+        let i = self
+            .next
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % self.senders.len();
+        self.senders[i]
+            .try_send(job)
+            .map_err(|e| match e {
+                std::sync::mpsc::TrySendError::Full(job) => job,
+                std::sync::mpsc::TrySendError::Disconnected(job) => job,
+            })
+    }
 }
 
 fn run_lifespan(app: &PyObject, kind: &str) -> Result<(), String> {
@@ -907,6 +990,7 @@ fn run_lifespan(app: &PyObject, kind: &str) -> Result<(), String> {
 }
 
 async fn serve_one(
+    pool: &PyWorkerPool,
     app: PyObject,
     req: Request<hyper::body::Incoming>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
@@ -927,51 +1011,49 @@ async fn serve_one(
             .unwrap();
         return Ok(resp);
     }
-    let body_vec = body.to_vec();
-    let joined = tokio::task::spawn_blocking(move || {
-        Python::with_gil(|py| {
-            use pyo3::types::PyBytes;
-            // NOTE: Vec<u8> wouldcross as list[int]; HTTP needs real bytes.
-            let py_headers: Vec<(String, PyObject)> = headers
-                .iter()
-                .map(|(k, v)| (k.clone(), PyBytes::new_bound(py, v).into_any().unbind()))
-                .collect();
-            let py_body = PyBytes::new_bound(py, &body_vec).into_any().unbind();
-            let helper = py
-                .import_bound("fasterapi._hyper_serve")
-                .map_err(|e| e.to_string())?;
-            let ret = helper
-                .getattr("run_request")
-                .map_err(|e| e.to_string())?
-                .call1((app, method, path, query, py_headers, py_body))
-                .map_err(|e| e.to_string())?;
-            ret.extract::<(u16, Vec<(String, String)>, Vec<u8>)>()
-                .map_err(|e| e.to_string())
-        })
-    })
-    .await;
-    let (status, resp_headers, resp_body) = match joined {
+    let body = body.to_vec();
+    // Brief GIL grab for the refcount bump; the job owns its app ref.
+    let job_app = Python::with_gil(|py| app.clone_ref(py));
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let job = PyJob {
+        app: job_app,
+        method,
+        path,
+        query,
+        headers,
+        body,
+        reply: tx,
+    };
+    // Bounded pool first; overflow degrades to spawn_blocking instead of
+    // deadlocking when every worker queue is momentarily full.
+    let out: Result<Result<(u16, Vec<(String, String)>, Vec<u8>), String>, String> =
+        match pool.dispatch(job) {
+            Ok(()) => rx.await.map_err(|_| "worker dropped job".to_string()),
+            Err(job) => match tokio::task::spawn_blocking(move || {
+                let (tx2, rx2) = tokio::sync::oneshot::channel();
+                run_py_job(PyJob { reply: tx2, ..job });
+                rx2.blocking_recv()
+                    .map_err(|_| "overflow worker dropped job".to_string())
+            })
+            .await
+            {
+                Ok(inner) => inner,
+                Err(e) => Err(format!("overflow join: {e}")),
+            },
+        };
+    let (status, resp_headers, resp_body) = match out {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => {
             eprintln!("fasterapi hyper: handler error: {e}");
-            (
-                500u16,
-                vec![("content-type".to_string(), "application/json".to_string())],
-                br#"{"detail":"Internal Server Error"}"#.to_vec(),
-            )
+            internal_error()
         }
         Err(e) => {
-            eprintln!("fasterapi hyper: worker join error: {e}");
-            (
-                500u16,
-                vec![("content-type".to_string(), "application/json".to_string())],
-                br#"{"detail":"Internal Server Error"}"#.to_vec(),
-            )
+            eprintln!("fasterapi hyper: dispatch error: {e}");
+            internal_error()
         }
     };
     let mut builder = Response::builder().status(
-        StatusCode::from_u16(status)
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
     );
     for (k, v) in &resp_headers {
         // Skip hop-by-hop / framing headers the server owns (`server` is
@@ -997,6 +1079,13 @@ async fn serve_one(
         .unwrap())
 }
 
+fn internal_error() -> (u16, Vec<(String, String)>, Vec<u8>) {    (
+        500u16,
+        vec![("content-type".to_string(), "application/json".to_string())],
+        br#"{"detail":"Internal Server Error"}"#.to_vec(),
+    )
+}
+
 /// Serve an ASGI app over Hyper + Tokio. Blocks until Ctrl-C (SIGINT).
 ///
 /// `workers=None` uses Tokio's default (one worker per CPU).
@@ -1015,7 +1104,11 @@ fn serve_asgi(
         builder.worker_threads(n.max(1));
     }
     let rt = builder.build().map_err(py_runtime_error)?;
-    py.allow_threads(|| run_until_ctrl_c(rt, app, host.to_string(), port))
+    let pool_size = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let pool = std::sync::Arc::new(PyWorkerPool::new(pool_size));
+    py.allow_threads(|| run_until_ctrl_c(rt, app, host.to_string(), port, pool))
         .map_err(py_runtime_error)
 }
 
@@ -1024,6 +1117,7 @@ fn run_until_ctrl_c(
     app: PyObject,
     host: String,
     port: u16,
+    pool: std::sync::Arc<PyWorkerPool>,
 ) -> Result<(), String> {
     rt.block_on(async move {
         run_lifespan(&app, "startup")?;
@@ -1040,10 +1134,12 @@ fn run_until_ctrl_c(
                     let io = TokioIo::new(stream);
                     // Brief GIL grab per connection for the refcount bump.
                     let app_ref = Python::with_gil(|py| app.clone_ref(py));
+                    let pool = pool.clone();
                     tokio::spawn(async move {
                         let svc = service_fn(move |req| {
                             let app_ref = Python::with_gil(|py| app_ref.clone_ref(py));
-                            serve_one(app_ref, req)
+                            let pool = pool.clone();
+                            async move { serve_one(&pool, app_ref, req).await }
                         });
                         if let Err(e) = http1::Builder::new()
                             .serve_connection(io, svc)

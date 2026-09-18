@@ -24,6 +24,23 @@ _LIFESPAN_CM: Any = None
 _tls = threading.local()
 
 
+def _direct_ok(app: Any) -> bool:
+    """Direct dispatch is valid only with zero user middleware.
+
+    Skipping Starlette's ServerError/Exception wrappers + router loop is
+    byte-identical only when no user middleware could observe or alter the
+    exchange. The check is a tiny isinstance scan (no cache → always fresh
+    if the app gains middleware later).
+    """
+    try:
+        from .middleware.asyncexitstack import AsyncExitStackMiddleware
+
+        middlewares = getattr(app, "user_middleware", None) or []
+        return all(entry[0] is AsyncExitStackMiddleware for entry in middlewares)
+    except Exception:
+        return False
+
+
 def _get_loop() -> asyncio.AbstractEventLoop:
     """One asyncio loop per worker thread, reused across requests.
 
@@ -100,6 +117,29 @@ def run_request(
             sent.setdefault("chunks", []).append(bytes(message.get("body", b"")))
 
     async def _go() -> None:
+        if _direct_ok(app):
+            # Fast lane: match via Starlette's own compiled matchers, then run
+            # the matched route app directly — no ServerError/Exception
+            # wrappers, no router loop. Anything unmatched (404/405/redirects)
+            # falls through to the full stack for exact handling.
+            from starlette.routing import Match
+
+            router = app.router
+            for route in router.routes:
+                matches = getattr(route, "matches", None)
+                if matches is None:
+                    continue
+                try:
+                    match, child_scope = matches(scope)
+                except Exception:
+                    continue
+                if match == Match.FULL:
+                    scope.update(child_scope)
+                    endpoint = getattr(route, "endpoint", None)
+                    if endpoint is not None:
+                        scope["endpoint"] = endpoint
+                    await route.app(scope, receive, send)
+                    return
         await app(scope, receive, send)
 
     try:

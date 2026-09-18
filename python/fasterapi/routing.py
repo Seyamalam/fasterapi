@@ -29,6 +29,7 @@ from . import _rust_bridge as _bridge
 from .encoders import jsonable_encoder
 from .exceptions import HTTPException, RequestValidationError
 from .params import Depends, Param
+from .params import _UNSET as _PARAM_UNSET
 from .security import SecurityScopes
 
 #: Cache key sharing one BackgroundTasks instance across an endpoint and its
@@ -674,6 +675,29 @@ def _resolve_body_param(
 _MISSING: Any = object()
 
 
+def _effective_response_model(explicit: Any, endpoint: Callable[..., Any]) -> Any:
+    """Mirror FastAPI: unset `response_model` falls back to the return annotation.
+
+    Explicit `response_model=None` disables filtering; `-> None` / missing
+    annotation means no model.
+    """
+    if explicit is not _PARAM_UNSET:
+        return explicit
+    try:
+        sig = _signature(endpoint) or inspect.signature(endpoint)
+        raw = sig.return_annotation
+    except (TypeError, ValueError):
+        return None
+    if raw is inspect.Signature.empty:
+        return None
+    ann = _ann_of(endpoint, "return", raw)
+    if ann is None or ann is type(None):
+        return None
+    if ann is inspect.Signature.empty:
+        return None
+    return ann
+
+
 class _InvalidJson(Exception):
     """Internal: cached body bytes are not valid JSON."""
 
@@ -1033,7 +1057,7 @@ class APIRouter:
         endpoint: Callable[..., Any],
         *,
         methods: Optional[list[str]] = None,
-        response_model: Any = None,
+        response_model: Any = _PARAM_UNSET,
         status_code: int = 200,
         response_class: Any = None,
         tags: Optional[list[str]] = None,
@@ -1057,7 +1081,8 @@ class APIRouter:
         self.routes.append(
             _RouteDef(
                 full, endpoint, methods or ["GET"],
-                response_model=response_model, status_code=status_code,
+                response_model=_effective_response_model(response_model, endpoint),
+                status_code=status_code,
                 response_class=rc, deprecated=deprecated,
                 response_model_include=response_model_include,
                 response_model_exclude=response_model_exclude,
