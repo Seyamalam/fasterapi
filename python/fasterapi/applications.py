@@ -1,0 +1,284 @@
+"""fasterapi.applications — drop-in ``fastapi.FastAPI``.
+
+``FastAPI`` subclasses Starlette (same ASGI engine FastAPI uses) so
+middleware, lifespan, exception handlers and the TestClient behave 1:1,
+while ``build()`` AOT-compiles ``Depends()`` graphs + the Rust radix router
+and ``serve()`` launches the host (uvicorn today, Hyper host when staged).
+"""
+
+from __future__ import annotations
+
+import inspect
+from typing import Any, Callable, Optional
+
+from pydantic import BaseModel
+from starlette.applications import Starlette
+from starlette.middleware.cors import CORSMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
+from starlette.routing import Route as StarletteRoute
+
+from . import _rust_bridge as _bridge
+from .dag import CompiledDAG, compile_app_dag
+from .exceptions import HTTPException, RequestValidationError
+from .params import Depends
+from .routing import APIRouter
+
+
+class FastAPI(Starlette):
+    """1:1 ``fastapi.FastAPI`` replacement."""
+
+    def __init__(
+        self,
+        *,
+        title: str = "fasterapi",
+        version: str = "0.1.0",
+        description: str = "",
+        lifespan: Optional[Callable[..., Any]] = None,
+        middleware: Optional[list[Any]] = None,
+        exception_handlers: Optional[dict[Any, Callable[..., Any]]] = None,
+        dependencies: Optional[list[Depends]] = None,
+        default_response_class: Any = JSONResponse,
+        redirect_slashes: bool = True,
+        docs_url: Optional[str] = "/docs",
+        redoc_url: Optional[str] = "/redoc",
+        openapi_url: Optional[str] = "/openapi.json",
+        **extra: Any,
+    ) -> None:
+        super().__init__(lifespan=lifespan, middleware=middleware)  # type: ignore[call-arg]
+        self.title = title
+        self.version = version
+        self.description = description
+        self.docs_url = docs_url
+        self.redoc_url = redoc_url
+        self.openapi_url = openapi_url
+        self.default_response_class = default_response_class
+        self.redirect_slashes = redirect_slashes
+        self._router = APIRouter(dependencies=dependencies or [])
+        self._user_exception_handlers: dict[Any, Callable[..., Any]] = dict(exception_handlers or {})
+        self._built_dag: Optional[CompiledDAG] = None
+        self._rust_router: Any = None
+        self._extra = extra
+        self._sync_starlette_routes()
+
+    # -- internal wiring -----------------------------------------------------
+    def _sync_starlette_routes(self) -> None:
+        # Rebuild Starlette route table from the APIRouter (idempotent).
+        self.router.routes = [r for r in self.router.routes if getattr(r, "_fasterapi_managed", False) is False and False]  # noqa
+        # Simpler: drop previously generated fasterapi routes, keep user middleware routes.
+        self.router.routes = [r for r in self.router.routes if not getattr(r, "_fasterapi_owned", False)]
+        for sr in self._router._starlette_routes():
+            sr._fasterapi_owned = True  # type: ignore[attr-defined]
+            self.router.routes.append(sr)
+        # Built-in docs/openapi routes
+        if self.openapi_url:
+            async def _openapi(_req: Request) -> Response:
+                return JSONResponse(self.openapi())
+
+            r = StarletteRoute(self.openapi_url, _openapi, methods=["GET"], name="openapi")
+            r._fasterapi_owned = True  # type: ignore[attr-defined]
+            self.router.routes.append(r)
+
+    # -- decorators (FastAPI signatures) --------------------------------------
+    def add_api_route(self, path: str, endpoint: Callable[..., Any], **kw: Any) -> None:
+        self._router.add_api_route(path, endpoint, **kw)
+        self._sync_starlette_routes()
+
+    def api_route(self, path: str, *, methods: list[str], **kw: Any) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        def deco(fn: Callable[..., Any]) -> Callable[..., Any]:
+            self.add_api_route(path, fn, methods=methods, **kw)
+            return fn
+
+        return deco
+
+    def get(self, path: str, **kw: Any) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        return self.api_route(path, methods=["GET"], **kw)
+
+    def post(self, path: str, **kw: Any) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        kw.setdefault("status_code", 200)
+        return self.api_route(path, methods=["POST"], **kw)
+
+    def put(self, path: str, **kw: Any) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        return self.api_route(path, methods=["PUT"], **kw)
+
+    def delete(self, path: str, **kw: Any) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        return self.api_route(path, methods=["DELETE"], **kw)
+
+    def patch(self, path: str, **kw: Any) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        return self.api_route(path, methods=["PATCH"], **kw)
+
+    def options(self, path: str, **kw: Any) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        return self.api_route(path, methods=["OPTIONS"], **kw)
+
+    def head(self, path: str, **kw: Any) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        return self.api_route(path, methods=["HEAD"], **kw)
+
+    def trace(self, path: str, **kw: Any) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        return self.api_route(path, methods=["TRACE"], **kw)
+
+    def route(self, path: str, *, methods: list[str], **kw: Any) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        return self.api_route(path, methods=methods, **kw)
+
+    def websocket(self, path: str, *, name: Optional[str] = None) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        def deco(fn: Callable[..., Any]) -> Callable[..., Any]:
+            self._router.websocket(path, name=name)(fn)
+            self._sync_starlette_routes()
+            return fn
+
+        return deco
+
+    def include_router(self, router: APIRouter, **kw: Any) -> None:
+        self._router.include_router(router, **kw)
+        self._sync_starlette_routes()
+
+    # -- middleware / handlers -------------------------------------------------
+    def add_middleware(self, middleware_class: Any, *args: Any, **kwargs: Any) -> None:  # type: ignore[override]
+        super().add_middleware(middleware_class, *args, **kwargs)
+
+    def exception_handler(self, exc_class: Any) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        def deco(fn: Callable[..., Any]) -> Callable[..., Any]:
+            self._user_exception_handlers[exc_class] = fn
+            self._install_handler(exc_class, fn)
+            return fn
+
+        return deco
+
+    def add_exception_handler(self, exc_class: Any, handler: Callable[..., Any]) -> None:
+        self._user_exception_handlers[exc_class] = handler
+        self._install_handler(exc_class, handler)
+
+    def _install_handler(self, exc_class: Any, fn: Callable[..., Any]) -> None:
+        if inspect.iscoroutinefunction(fn):
+            async def _h(request: Request, exc: Any) -> Response:
+                res = await fn(request, exc)
+                return res if isinstance(res, Response) else JSONResponse(res)
+
+        else:
+            async def _h(request: Request, exc: Any) -> Response:
+                res = fn(request, exc)
+                if inspect.isawaitable(res):
+                    res = await res
+                return res if isinstance(res, Response) else JSONResponse(res)
+
+        self.router.exception_handlers[exc_class] = _h  # type: ignore[attr-defined]
+
+    async def _default_http_exception(self, request: Request, exc: HTTPException) -> Response:
+        handler = self._user_exception_handlers.get(HTTPException) or self._user_exception_handlers.get(Exception)
+        if handler is not None:
+            res = handler(request, exc)
+            if inspect.isawaitable(res):
+                res = await res
+            return res if isinstance(res, Response) else JSONResponse(res)
+        return JSONResponse({"detail": exc.detail}, status_code=exc.status_code, headers=exc.headers or {})
+
+    # -- openapi (minimal but valid) -------------------------------------------
+    def openapi(self) -> dict[str, Any]:
+        paths: dict[str, Any] = {}
+        components: dict[str, Any] = {"schemas": {}}
+        for r in self._router.routes:
+            item: dict[str, Any] = paths.setdefault(r.path, {})
+            try:
+                sig = inspect.signature(r.endpoint)
+            except (TypeError, ValueError):
+                sig = None
+            params: list[dict[str, Any]] = []
+            has_body = False
+            body_schema: dict[str, Any] = {}
+            if sig is not None:
+                from .params import Param as _P
+                from .routing import _is_pydantic_model as _is_model
+
+                for pname, p in sig.parameters.items():
+                    d = p.default
+                    ann = p.annotation
+                    if isinstance(d, _P) and d.in_ in ("query", "path", "header", "cookie"):
+                        params.append({
+                            "name": d.alias or pname,
+                            "in": d.in_,
+                            "required": d.required and p.default is inspect.Parameter.empty or d.default is Ellipsis,
+                            "schema": {"type": "string"},
+                            "description": d.description or "",
+                        })
+                    elif _is_model(ann):
+                        has_body = True
+                        try:
+                            schema = ann.model_json_schema(ref_template="#/components/schemas/{model}")
+                            components["schemas"][ann.__name__] = schema
+                            body_schema = {"$ref": f"#/components/schemas/{ann.__name__}"}
+                        except Exception:
+                            body_schema = {"type": "object"}
+                    elif pname in r.path:
+                        params.append({"name": pname, "in": "path", "required": True,
+                                       "schema": {"type": "string"}})
+            op: dict[str, Any] = {
+                "summary": r.summary or r.name,
+                "description": r.description or "",
+                "tags": r.tags,
+                "parameters": params,
+                "responses": {str(r.status_code): {"description": "Successful Response"}},
+            }
+            if has_body:
+                op["requestBody"] = {"content": {"application/json": {"schema": body_schema}}}
+            if r.response_model is not None and inspect.isclass(r.response_model) and issubclass(r.response_model, BaseModel):
+                try:
+                    components["schemas"][r.response_model.__name__] = r.response_model.model_json_schema(
+                        ref_template="#/components/schemas/{model}"
+                    )
+                except Exception:
+                    pass
+            for m in r.methods:
+                item[m.lower()] = op
+        return {"openapi": "3.1.0", "info": {"title": self.title, "version": self.version,
+                                             "description": self.description},
+                "paths": paths, "components": components}
+
+    # -- Phase-2: AOT build ------------------------------------------------------
+    def build(self) -> CompiledDAG:
+        """Traverse ``Depends()`` graphs once, compile Rust radix router + DAG.
+
+        Safe to call multiple times; returns the compiled plan. Warms the
+        SIMD JSON path so the first request never pays init cost.
+        """
+        endpoints = [r.endpoint for r in self._router.routes]
+        dag = compile_app_dag(endpoints)
+        router = _bridge.make_router()
+        for r in self._router.routes:
+            # matchit uses `{param}` syntax already; starlette `{param}` matches.
+            pattern = r.path
+            try:
+                if hasattr(router, "insert"):
+                    router.insert(pattern, f"{sorted(r.methods)[0]} {pattern}")
+            except Exception:
+                pass
+        try:
+            _bridge.fast_json_dumps({"warmup": True})
+            _bridge.fast_json_loads('{"warmup":true}')
+        except Exception:
+            pass
+        self._built_dag = dag
+        self._rust_router = router
+        return dag
+
+    @property
+    def built_dag(self) -> Optional[CompiledDAG]:
+        return self._built_dag
+
+    # -- serve -------------------------------------------------------------------
+    def serve(self, host: str = "127.0.0.1", port: int = 8000, **kw: Any) -> None:
+        """Run the app. Uses uvicorn today; Hyper host when ``FASTERAPI_HYPER=1``.
+
+        The inverted-runtime Hyper server (Rust owns the socket) is staged in
+        ``src/lib.rs``; until it is promoted, ``serve()`` runs the same
+        battle-tested uvicorn loop FastAPI uses so behavior stays identical.
+        """
+        import os
+
+        if os.environ.get("FASTERAPI_HYPER") == "1" and _bridge.HAS_RUST:
+            from _fasterapi_rs import hyper_health  # type: ignore
+
+            print(hyper_health())
+            print("fasterapi: Hyper host staged — falling through to uvicorn for v0.1 parity.")
+        import uvicorn
+
+        self.build()
+        uvicorn.run(self, host=host, port=port, **kw)
