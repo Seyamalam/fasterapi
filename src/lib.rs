@@ -515,7 +515,7 @@ fn serve_static_config(path: &str) -> String {
         "path": path,
         "exists": exists,
         "size_bytes": size,
-        "strategy": if exists && size > 0 { "tokio-sendfile-zero-copy" } else { "python-fallback" },
+        "strategy": if exists && size > 0 { "sendfile-zero-copy" } else { "python-fallback" },
     })
     .to_string()
 }

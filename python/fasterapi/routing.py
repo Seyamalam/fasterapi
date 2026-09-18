@@ -18,8 +18,9 @@ from typing import Any, Callable, Coroutine, Optional, Union, get_origin
 
 from pydantic import BaseModel, TypeAdapter
 from starlette.background import BackgroundTasks
+from starlette.concurrency import iterate_in_threadpool
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route as StarletteRoute
 from starlette.routing import WebSocketRoute
 from starlette.websockets import WebSocket
@@ -710,6 +711,7 @@ class _RouteDef:
         *,
         response_model: Any = None,
         status_code: int = 200,
+        response_class: Any = None,
         tags: Optional[list[str]] = None,
         summary: Optional[str] = None,
         description: Optional[str] = None,
@@ -721,6 +723,7 @@ class _RouteDef:
         self.methods = [m.upper() for m in methods]
         self.response_model = response_model
         self.status_code = status_code
+        self.response_class = response_class
         self.tags = tags or []
         self.summary = summary
         self.description = description
@@ -826,6 +829,9 @@ def _make_http_handler(route: _RouteDef, router_deps: list[Depends]) -> Callable
                                     headers=exc.headers or {})
             except RequestValidationError as exc:
                 return JSONResponse({"detail": exc.errors()}, status_code=422)
+            # SSE: generator endpoint + EventSourceResponse streams frames.
+            if _is_sse_route(route) and (inspect.isasyncgen(result) or inspect.isgenerator(result)):
+                return _with_background(_sse_response(result, route.status_code), cache)
             try:
                 payload = _serialize_response(result, route.response_model, route.status_code)
             except Exception as exc:
@@ -854,6 +860,54 @@ def _with_background(response: Response, cache: dict[int, Any]) -> Response:
     except Exception:
         pass
     return response
+
+
+def _is_sse_route(route: _RouteDef) -> bool:
+    try:
+        from .sse import EventSourceResponse
+
+        return (
+            route.response_class is not None
+            and inspect.isclass(route.response_class)
+            and issubclass(route.response_class, EventSourceResponse)
+        )
+    except Exception:
+        return False
+
+
+def _serialize_sse_item(item: Any) -> bytes:
+    """Mirror FastAPI's per-item SSE encoding exactly."""
+    from .sse import ServerSentEvent, format_sse_event
+
+    if isinstance(item, ServerSentEvent):
+        if item.raw_data is not None:
+            data_str = item.raw_data
+        elif item.data is not None:
+            if hasattr(item.data, "model_dump_json"):
+                data_str = item.data.model_dump_json()
+            else:
+                data_str = _stdlib_json.dumps(jsonable_encoder(item.data))
+        else:
+            data_str = None
+        return format_sse_event(
+            data_str=data_str, event=item.event, id=item.id,
+            retry=item.retry, comment=item.comment,
+        )
+    return format_sse_event(
+        data_str=_stdlib_json.dumps(jsonable_encoder(item)).encode("utf-8").decode("utf-8")
+    )
+
+
+def _sse_response(gen: Any, status_code: int) -> StreamingResponse:
+    async def _aiter():  # type: ignore[no-untyped-def]
+        if inspect.isasyncgen(gen):
+            async for item in gen:
+                yield _serialize_sse_item(item)
+        else:
+            async for item in iterate_in_threadpool(gen):
+                yield _serialize_sse_item(item)
+
+    return StreamingResponse(_aiter(), status_code=status_code, media_type="text/event-stream")
 
 
 # ---------------------------------------------------------------- router ---
@@ -893,6 +947,7 @@ class APIRouter:
         methods: Optional[list[str]] = None,
         response_model: Any = None,
         status_code: int = 200,
+        response_class: Any = None,
         tags: Optional[list[str]] = None,
         summary: Optional[str] = None,
         description: Optional[str] = None,
@@ -901,10 +956,14 @@ class APIRouter:
         **_extra: Any,
     ) -> None:
         full = self.prefix + (path if path.startswith("/") else "/" + path)
+        rc = response_class if response_class is not None else self.default_response_class
+        if rc is JSONResponse:
+            rc = None  # default JSON rendering needs no marker
         self.routes.append(
             _RouteDef(
                 full, endpoint, methods or ["GET"],
                 response_model=response_model, status_code=status_code,
+                response_class=rc,
                 tags=[*(self.tags or []), *(tags or [])],
                 summary=summary, description=description,
                 dependencies=[*self.dependencies, *(dependencies or [])],
@@ -979,6 +1038,7 @@ class APIRouter:
             merged = _RouteDef(
                 prefix.rstrip("/") + r.path, r.endpoint, r.methods,
                 response_model=r.response_model, status_code=r.status_code,
+                response_class=r.response_class,
                 tags=[*r.tags, *extra_tags], summary=r.summary,
                 description=r.description,
                 dependencies=[*r.dependencies, *extra_deps], name=r.name,
