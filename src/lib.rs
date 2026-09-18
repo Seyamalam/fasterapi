@@ -30,7 +30,6 @@ use std::time::Instant;
 use parking_lot::RwLock;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString};
-
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // ---------------------------------------------------------------------------
@@ -72,83 +71,192 @@ fn value_to_py(py: Python<'_>, v: &serde_json::Value) -> PyObject {
     }
 }
 
-fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
-    let py = obj.py();
-    if obj.is_none() {
-        return Ok(serde_json::Value::Null);
+fn write_json_str(buf: &mut String, s: &str) {
+    buf.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => buf.push_str("\\\""),
+            '\\' => buf.push_str("\\\\"),
+            '\n' => buf.push_str("\\n"),
+            '\r' => buf.push_str("\\r"),
+            '\t' => buf.push_str("\\t"),
+            '\u{08}' => buf.push_str("\\b"),
+            '\u{0C}' => buf.push_str("\\f"),
+            c if (c as u32) < 0x20 => {
+                buf.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => buf.push(c),
+        }
+    }
+    buf.push('"');
+}
+
+fn write_json_key(buf: &mut String, obj: &Bound<'_, PyAny>) -> PyResult<()> {
+    // Mirror CPython: str as-is, int/float/bool/None coerced, else TypeError.
+    if let Ok(s) = obj.downcast::<PyString>() {
+        write_json_str(buf, &s.to_string());
+        return Ok(());
     }
     if let Ok(b) = obj.downcast::<PyBool>() {
-        return Ok(serde_json::Value::Bool(b.is_true()));
+        buf.push_str(if b.is_true() { "true" } else { "false" });
+        return Ok(());
     }
-    if let Ok(s) = obj.downcast::<PyString>() {
-        return Ok(serde_json::Value::String(s.to_string()));
-    }
-    if let Ok(f) = obj.downcast::<PyFloat>() {
-        let v = f.value();
-        return Ok(serde_json::Number::from_f64(v)
-            .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null));
+    if obj.is_none() {
+        buf.push_str("null");
+        return Ok(());
     }
     if let Ok(i) = obj.downcast::<PyInt>() {
         if let Ok(iv) = i.extract::<i64>() {
-            return Ok(serde_json::Value::Number(iv.into()));
+            buf.push_str(&iv.to_string());
+            return Ok(());
         }
         if let Ok(uv) = i.extract::<u64>() {
-            return Ok(serde_json::Value::Number(uv.into()));
+            buf.push_str(&uv.to_string());
+            return Ok(());
         }
-        // Fall back to float for big ints.
         let f: f64 = i.extract()?;
-        return Ok(serde_json::Number::from_f64(f)
-            .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null));
+        write_json_float(buf, f);
+        return Ok(());
+    }
+    if let Ok(f) = obj.downcast::<PyFloat>() {
+        write_json_float(buf, f.value());
+        return Ok(());
+    }
+    Err(pyo3::exceptions::PyTypeError::new_err(
+        "keys must be str, int, float, bool or None",
+    ))
+}
+
+fn write_json_float(buf: &mut String, v: f64) {
+    if v.is_infinite() {
+        buf.push_str(if v.is_sign_positive() {
+            "Infinity"
+        } else {
+            "-Infinity"
+        });
+    } else if v.is_nan() {
+        buf.push_str("NaN");
+    } else if v.fract() == 0.0 && v.abs() < 1e21 {
+        buf.push_str(&format!("{v:.1}"));
+    } else {
+        buf.push_str(&v.to_string());
+    }
+}
+
+fn write_json_value(buf: &mut String, obj: &Bound<'_, PyAny>) -> PyResult<()> {
+    if obj.is_none() {
+        buf.push_str("null");
+        return Ok(());
+    }
+    if let Ok(b) = obj.downcast::<PyBool>() {
+        buf.push_str(if b.is_true() { "true" } else { "false" });
+        return Ok(());
+    }
+    if let Ok(s) = obj.downcast::<PyString>() {
+        write_json_str(buf, &s.to_string());
+        return Ok(());
+    }
+    if let Ok(i) = obj.downcast::<PyInt>() {
+        if let Ok(iv) = i.extract::<i64>() {
+            buf.push_str(&iv.to_string());
+            return Ok(());
+        }
+        if let Ok(uv) = i.extract::<u64>() {
+            buf.push_str(&uv.to_string());
+            return Ok(());
+        }
+        let f: f64 = i.extract()?;
+        write_json_float(buf, f);
+        return Ok(());
+    }
+    if let Ok(f) = obj.downcast::<PyFloat>() {
+        write_json_float(buf, f.value());
+        return Ok(());
     }
     if let Ok(list) = obj.downcast::<PyList>() {
-        let mut out = Vec::with_capacity(list.len());
+        buf.push('[');
+        let mut first = true;
         for item in list.iter() {
-            out.push(py_to_value(&item)?);
+            if !first {
+                buf.push(',');
+            }
+            first = false;
+            write_json_value(buf, &item)?;
         }
-        return Ok(serde_json::Value::Array(out));
+        buf.push(']');
+        return Ok(());
+    }
+    if let Ok(tup) = obj.downcast::<pyo3::types::PyTuple>() {
+        buf.push('[');
+        let mut first = true;
+        for item in tup.iter() {
+            if !first {
+                buf.push(',');
+            }
+            first = false;
+            write_json_value(buf, &item)?;
+        }
+        buf.push(']');
+        return Ok(());
     }
     if let Ok(dict) = obj.downcast::<PyDict>() {
-        let mut map = serde_json::Map::with_capacity(dict.len());
+        buf.push('{');
+        let mut first = true;
         for (k, v) in dict.iter() {
-            let key: String = k.extract()?;
-            map.insert(key, py_to_value(&v)?);
+            if !first {
+                buf.push(',');
+            }
+            first = false;
+            write_json_key(buf, &k)?;
+            buf.push(':');
+            write_json_value(buf, &v)?;
         }
-        return Ok(serde_json::Value::Object(map));
+        buf.push('}');
+        return Ok(());
     }
-    // Fallback: ask Python for a JSON-compatible repr via `str()`.
-    // (Callers should pass plain JSON types on the hot path.)
-    let _ = py;
-    Err(pyo3::exceptions::PyTypeError::new_err(
-        "fast_json_dumps: object is not JSON-serializable (pass dict/list/str/int/float/bool/None)",
-    ))
+    Err(pyo3::exceptions::PyTypeError::new_err(format!(
+        "Object of type {} is not JSON serializable",
+        obj.get_type()
+            .qualname()
+            .map(|q| q.to_string())
+            .unwrap_or_else(|_| "?".to_string())
+    )))
 }
 
 /// SIMD-accelerated JSON parse. Releases the GIL during parsing.
 ///
-/// Falls back to `serde_json` if the input is not valid UTF-8 SIMD JSON.
+/// Falls back to `serde_json`, then to stdlib-compatible behavior for inputs
+/// only Python accepts (`Infinity`, `NaN`) so results match `json.loads`.
 #[pyfunction]
 fn fast_json_loads(py: Python<'_>, payload: &str) -> PyResult<PyObject> {
     // simd-json mutates its input, so work on a private copy off-GIL.
-    let value: serde_json::Value = py
+    let parsed: Result<serde_json::Value, String> = py
         .allow_threads(|| {
             let mut bytes = payload.as_bytes().to_vec();
             simd_json::from_slice::<serde_json::Value>(&mut bytes)
                 .or_else(|_| serde_json::from_str::<serde_json::Value>(payload))
-        })
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-    Ok(value_to_py(py, &value))
+                .map_err(|e| e.to_string())
+        });
+    match parsed {
+        Ok(value) => Ok(value_to_py(py, &value)),
+        Err(_) => {
+            // Slow path (invalid/edge input only): delegate to stdlib for
+            // exact messages, positions and Infinity/NaN acceptance.
+            let json_mod = py.import_bound("json")?;
+            let loads = json_mod.getattr("loads")?;
+            loads.call1((payload,))?.extract()
+        }
+    }
 }
 
-/// SIMD-friendly JSON serialize. Releases the GIL during serialization.
+/// Direct JSON serialize: walks Python objects straight into the output
+/// buffer (no intermediate `serde_json::Value`), mirroring stdlib semantics.
 #[pyfunction]
 fn fast_json_dumps(py: Python<'_>, obj: PyObject) -> PyResult<String> {
-    let value = py_to_value(obj.bind(py))?;
-    py.allow_threads(|| {
-        serde_json::to_string(&value)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
-    })
+    let bound = obj.bind(py);
+    let mut buf = String::with_capacity(128);
+    write_json_value(&mut buf, bound)?;
+    Ok(buf)
 }
 
 // ---------------------------------------------------------------------------
@@ -530,7 +638,7 @@ fn has_simd() -> bool {
 //
 // Philosophy: every scalar coercion + constraint check that FastAPI does in
 // Python (`int("42")`, `ge/le/gt/lt`, `min/max_length`, `pattern`, bool
-// parsing, percent-decoding) runs here on Tokio threads with `allow_threads`.
+// parsing, percent-decoding) runs here with `allow_threads`.
 // Python only maps the typed error into the 422 `{"detail": [...]}` shape, so
 // behavior stays 1:1 while the hot loop never touches the GIL or allocator
 // more than once. All functions are pure + thread-safe (no shared mutables)
@@ -753,6 +861,209 @@ fn parse_query_pairs(py: Python<'_>, qs: &str) -> PyResult<Vec<(String, String)>
 }
 
 // ---------------------------------------------------------------------------
+// Hyper ASGI host spike
+//
+// Rust owns the TCP sockets + HTTP/1.1 parsing (Hyper) on a multi-thread
+// Tokio runtime. Each request's method/path/query/headers/body is handed to
+// the in-process Python ASGI app (`fasterapi._hyper_serve.run_request`),
+// which drives `app(scope, receive, send)` on a per-call asyncio loop and
+// returns `(status, headers, body)`. Lifespan runs around serving.
+//
+// Deliberate spike limits (documented, not hidden): HTTP/1.1 only, full body
+// buffered before dispatch (16 MiB cap → 413), streaming responses are
+// concatenated, no disconnect polling mid-response. The point being proven:
+// sockets + parsing in Rust, identical app bytes, measurable RPS delta.
+// ---------------------------------------------------------------------------
+
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Request, Response, StatusCode};
+use hyper_util::rt::TokioIo;
+
+const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+fn py_runtime_error(msg: impl ToString) -> pyo3::PyErr {
+    pyo3::exceptions::PyRuntimeError::new_err(msg.to_string())
+}
+
+fn run_lifespan(app: &PyObject, kind: &str) -> Result<(), String> {
+    let app = Python::with_gil(|py| app.clone_ref(py));
+    let kind = kind.to_string();
+    tokio::task::block_in_place(|| {
+        Python::with_gil(|py| {
+            let helper = py
+                .import_bound("fasterapi._hyper_serve")
+                .map_err(|e| e.to_string())?;
+            helper
+                .getattr("run_lifespan")
+                .map_err(|e| e.to_string())?
+                .call1((app, kind))
+                .map_err(|e| e.to_string())?;
+            Ok::<(), String>(())
+        })
+    })
+}
+
+async fn serve_one(
+    app: PyObject,
+    req: Request<hyper::body::Incoming>,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let method = req.method().to_string();
+    let uri = req.uri().clone();
+    let path = uri.path().to_string();
+    let query = uri.query().unwrap_or("").to_string();
+    let mut headers: Vec<(String, Vec<u8>)> = Vec::new();
+    for (name, value) in req.headers() {
+        headers.push((name.to_string(), value.as_bytes().to_vec()));
+    }
+    let collected = req.collect().await?;
+    let body = collected.to_bytes();
+    if body.len() > MAX_BODY_BYTES {
+        let resp = Response::builder()
+            .status(StatusCode::PAYLOAD_TOO_LARGE)
+            .body(Full::new(Bytes::from_static(b"Request body too large")))
+            .unwrap();
+        return Ok(resp);
+    }
+    let body_vec = body.to_vec();
+    let joined = tokio::task::spawn_blocking(move || {
+        Python::with_gil(|py| {
+            use pyo3::types::PyBytes;
+            // NOTE: Vec<u8> wouldcross as list[int]; HTTP needs real bytes.
+            let py_headers: Vec<(String, PyObject)> = headers
+                .iter()
+                .map(|(k, v)| (k.clone(), PyBytes::new_bound(py, v).into_any().unbind()))
+                .collect();
+            let py_body = PyBytes::new_bound(py, &body_vec).into_any().unbind();
+            let helper = py
+                .import_bound("fasterapi._hyper_serve")
+                .map_err(|e| e.to_string())?;
+            let ret = helper
+                .getattr("run_request")
+                .map_err(|e| e.to_string())?
+                .call1((app, method, path, query, py_headers, py_body))
+                .map_err(|e| e.to_string())?;
+            ret.extract::<(u16, Vec<(String, String)>, Vec<u8>)>()
+                .map_err(|e| e.to_string())
+        })
+    })
+    .await;
+    let (status, resp_headers, resp_body) = match joined {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => {
+            eprintln!("fasterapi hyper: handler error: {e}");
+            (
+                500u16,
+                vec![("content-type".to_string(), "application/json".to_string())],
+                br#"{"detail":"Internal Server Error"}"#.to_vec(),
+            )
+        }
+        Err(e) => {
+            eprintln!("fasterapi hyper: worker join error: {e}");
+            (
+                500u16,
+                vec![("content-type".to_string(), "application/json".to_string())],
+                br#"{"detail":"Internal Server Error"}"#.to_vec(),
+            )
+        }
+    };
+    let mut builder = Response::builder().status(
+        StatusCode::from_u16(status)
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+    );
+    for (k, v) in &resp_headers {
+        // Skip hop-by-hop / framing headers the server owns (`server` is
+        // re-stamped below — the app layer still thinks in uvicorn terms).
+        let kl = k.to_ascii_lowercase();
+        if kl == "content-length"
+            || kl == "transfer-encoding"
+            || kl == "connection"
+            || kl == "server"
+        {
+            continue;
+        }
+        if let (Ok(name), Ok(value)) = (
+            hyper::header::HeaderName::from_bytes(k.as_bytes()),
+            hyper::header::HeaderValue::from_bytes(v.as_bytes()),
+        ) {
+            builder = builder.header(name, value);
+        }
+    }
+    Ok(builder
+        .header("server", "fasterapi-hyper")
+        .body(Full::new(Bytes::from(resp_body)))
+        .unwrap())
+}
+
+/// Serve an ASGI app over Hyper + Tokio. Blocks until Ctrl-C (SIGINT).
+///
+/// `workers=None` uses Tokio's default (one worker per CPU).
+#[pyfunction]
+#[pyo3(signature = (app, host="127.0.0.1", port=8000, workers=None))]
+fn serve_asgi(
+    py: Python<'_>,
+    app: PyObject,
+    host: &str,
+    port: u16,
+    workers: Option<usize>,
+) -> PyResult<()> {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.enable_all().thread_name("fasterapi-hyper");
+    if let Some(n) = workers {
+        builder.worker_threads(n.max(1));
+    }
+    let rt = builder.build().map_err(py_runtime_error)?;
+    py.allow_threads(|| run_until_ctrl_c(rt, app, host.to_string(), port))
+        .map_err(py_runtime_error)
+}
+
+fn run_until_ctrl_c(
+    rt: tokio::runtime::Runtime,
+    app: PyObject,
+    host: String,
+    port: u16,
+) -> Result<(), String> {
+    rt.block_on(async move {
+        run_lifespan(&app, "startup")?;
+        let addr = format!("{host}:{port}");
+        let listener = tokio::net::TcpListener::bind(&addr)
+            .await
+            .map_err(|e| format!("bind {addr}: {e}"))?;
+        loop {
+            tokio::select! {
+                conn = listener.accept() => {
+                    let (stream, _peer) = conn.map_err(|e| e.to_string())?;
+                    // Disable Nagle: small JSON responses must not wait for ACKs.
+                    let _ = stream.set_nodelay(true);
+                    let io = TokioIo::new(stream);
+                    // Brief GIL grab per connection for the refcount bump.
+                    let app_ref = Python::with_gil(|py| app.clone_ref(py));
+                    tokio::spawn(async move {
+                        let svc = service_fn(move |req| {
+                            let app_ref = Python::with_gil(|py| app_ref.clone_ref(py));
+                            serve_one(app_ref, req)
+                        });
+                        if let Err(e) = http1::Builder::new()
+                            .serve_connection(io, svc)
+                            .await
+                        {
+                            eprintln!("fasterapi hyper: connection error: {e}");
+                        }
+                    });
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    break;
+                }
+            }
+        }
+        run_lifespan(&app, "shutdown")?;
+        Ok(())
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Module
 // ---------------------------------------------------------------------------
 
@@ -773,6 +1084,7 @@ fn _fasterapi_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(validate_str, m)?)?;
     m.add_function(wrap_pyfunction!(percent_decode, m)?)?;
     m.add_function(wrap_pyfunction!(parse_query_pairs, m)?)?;
+    m.add_function(wrap_pyfunction!(serve_asgi, m)?)?;
     m.add_class::<RustRouter>()?;
     m.add_class::<TokenBucket>()?;
     m.add_class::<DependencyDAG>()?;

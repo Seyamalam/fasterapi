@@ -13,8 +13,6 @@ crate-type = ["cdylib"]
 
 [dependencies]
 # Minimal native core: only what the shipped fast-paths actually use.
-# (The Tokio + Hyper inverted-host stack lands with the staged server —
-# see src/lib.rs — and is deliberately NOT a dependency until then.)
 pyo3 = { version = "0.22", features = ["extension-module"] }
 matchit = "0.7"
 serde = { version = "1", features = ["derive"] }
@@ -24,6 +22,13 @@ governor = "0.6"
 parking_lot = "0.12"
 regex = "1"
 percent-encoding = "2"
+# Hyper host spike (tasks: Rust owns sockets + HTTP parsing, Python runs the
+# ASGI app in-process). Minimal features only.
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time", "signal"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["server", "tokio"] }
+http-body-util = "0.1"
+bytes = "1"
 
 [profile.release]
 lto = true

@@ -259,22 +259,22 @@ Micro fast-paths (in-process, no servers):
 
 | Check | Baseline | fasterapi | Speedup |
 |---|---|---|---|
-| JSON `loads` | 0.0382s stdlib | 0.0647s SIMD | x0.59 |
-| JSON `dumps` | stdlib | Rust bridge | x0.94 |
-| Model validate (`loads`+`validate_python` vs `validate_json`) | 0.0045s | 0.0021s | x2.2 |
-| Model dump (`dump_python`+`dumps` vs `dump_json`) | 0.0059s | 0.002s | x2.93 |
-| Router match | 0.2754s Python | 0.085s `matchit` | x3.24 |
+| JSON `loads` | 0.0373s stdlib | 0.0654s SIMD | x0.57 |
+| JSON `dumps` | stdlib | Rust bridge | x1.08 |
+| Model validate (`loads`+`validate_python` vs `validate_json`) | 0.0047s | 0.0021s | x2.21 |
+| Model dump (`dump_python`+`dumps` vs `dump_json`) | 0.0059s | 0.002s | x2.91 |
+| Router match | 0.2803s Python | 0.0836s `matchit` | x3.35 |
 
 Macro load (loopback, httpx concurrency; last full run):
 
-Run: `2026-09-18`, speedup **x0.987** (pre-push: micro strict 3x + macro parity band x0.95).
+Run: `2026-09-18`, host `hyper`, speedup **x0.974** (pre-push: micro strict 3x + macro parity band x0.95).
 
 | Server | RPS | p50 | p90 | p99 | RSS |
 |---|---|---|---|---|---|
-| fastapi+uvicorn | 758.8 | 43.41ms | 142.543ms | 267.53ms | 52.8MB |
-| fasterapi | 749.3 | 42.622ms | 146.385ms | 288.404ms | 55.6MB |
+| fastapi+uvicorn | 776.8 | 7.674ms | 18.348ms | 25.738ms | 52.9MB |
+| fasterapi | 756.4 | 9.711ms | 19.467ms | 98.461ms | 56.3MB |
 
-POST /items (Pydantic validation path): fastapi+uvicorn 671.1 RPS vs fasterapi 665.8 RPS → **x0.992**.
+POST /items (Pydantic validation path): fastapi+uvicorn 693.1 RPS vs fasterapi 669.9 RPS → **x0.967**.
 <!-- BENCH:END -->
 
 Design rule going forward: **as much as possible in Rust,
