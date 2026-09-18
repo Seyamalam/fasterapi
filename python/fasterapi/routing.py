@@ -14,7 +14,6 @@ from contextlib import AsyncExitStack
 from typing import Any, Callable, Coroutine, Optional, Union, get_origin
 
 from pydantic import BaseModel, TypeAdapter
-from starlette.datastructures import UploadFile as StarletteUploadFile
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route as StarletteRoute

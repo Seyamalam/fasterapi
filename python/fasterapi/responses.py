@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import os
-from typing import Optional
-
 from starlette.responses import (  # noqa: F401
     FileResponse as _StarletteFileResponse,
     HTMLResponse,

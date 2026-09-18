@@ -1,21 +1,26 @@
-//! fasterapi — Rust core (`_fasterapi_rs`).
+//! fasterapi — Rust core (`fasterapi._fasterapi_rs`).
 //!
-//! Phase-2 engine components:
-//!   * `RustRouter` — zero-Python radix-tree routing (`matchit`), mirrors the
-//!     Python route table compiled by `app.build()`.
-//!   * `fast_json_loads` / `fast_json_dumps` — SIMD JSON fast-path
-//!     (`simd-json` + `serde_json`) with `allow_threads` so Tokio
-//!     work-stealing threads never block on the GIL.
+//! Shipped fast-paths (minimal deps, all GIL-aware via `allow_threads`):
+//!   * `RustRouter` — zero-Python radix-tree routing (`matchit`); Python pushes
+//!     its route table once at `app.build()` (FastAPI `{param}` syntax is
+//!     compiled to matchit `:param` on insert).
+//!   * `fast_json_loads` / `fast_json_dumps` — SIMD JSON (`simd-json`).
+//!   * `validate_int/float/bool/str`, `percent_decode`, `parse_query_pairs` —
+//!     strict, type-safe scalar coercion + constraints for query/path/header.
 //!   * `TokenBucket` — socket-level token-bucket rate limiting (`governor`),
 //!     returning 429 without touching Python.
 //!   * `DependencyDAG` — AOT-compiled `Depends()` graph: topological order +
-//!     concurrent levels for Tokio to fan-out async dependencies.
-//!   * Hyper 1.x / Tokio host hooks (`hyper_health`, `serve_static_config`).
+//!     concurrent levels for fanning out async dependencies.
+//!   * Host helpers (`hyper_health`, `tokio_worker_count`, `process_rss_bytes`,
+//!     `serve_static_config`).
 //!
-//! The full inverted-runtime Hyper host (Rust owns the socket, Python runs as
-//! an embedded guest via PyO3) is staged behind `serve_hyper()`; v0.1 ships
-//! the data-plane primitives + a verified pure-Python Starlette host so
-//! 1:1 FastAPI parity lands first and every micro-benchmark is measurable.
+//! The inverted-runtime Hyper + Tokio host (Rust owns the socket, Python runs
+//! as an embedded guest) is staged, not shipped: its stack (tokio, hyper,
+//! hyper-util) is deliberately absent from Cargo.toml until it lands, keeping
+//! the build light. Parity stays king until then — Starlette host + Pydantic.
+//!
+//! Threading: every entry point is pure + lock-clean (`parking_lot`), safe for
+//! Python 3.13+ free-threaded (`--disable-gil`) runtimes.
 
 use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroU32;

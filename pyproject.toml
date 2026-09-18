@@ -5,12 +5,12 @@ build-backend = "maturin"
 [project]
 name = "fasterapi"
 version = "0.1.0"
-description = "Ultra-high-performance FastAPI drop-in replacement — Rust (Tokio + Hyper + PyO3) core, Python 3.13+ free-threaded ready"
+description = "1:1 FastAPI drop-in replacement with a native Rust (PyO3) core — radix routing, SIMD JSON, type-safe validators, edge guards"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
 authors = [{ name = "Seyamalam" }]
-keywords = ["fastapi", "web", "rust", "hyper", "tokio", "pyo3", "asgi", "performance"]
+keywords = ["fastapi", "web", "rust", "pyo3", "performance"]
 classifiers = [
   "Development Status :: 4 - Beta",
   "Intended Audience :: Developers",
@@ -26,10 +26,10 @@ classifiers = [
   "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
 ]
 dependencies = [
+  # Minimal runtime: Starlette (HTTP engine) + Pydantic v2 (validation).
+  # TestClient users also need httpx -> install the `standard` extra.
   "starlette>=0.37",
   "pydantic>=2.0",
-  "httpx>=0.24",
-  "anyio>=4.0",
 ]
 
 [project.optional-dependencies]
@@ -40,10 +40,10 @@ standard = [
 test = [
   "pytest>=8.0",
   "pytest-asyncio>=0.23",
-  "anyio>=4.0",
   "fastapi>=0.110",
   "uvicorn>=0.29",
   "httpx>=0.24",
+  "python-multipart>=0.0.9",
 ]
 bench = [
   "uvicorn>=0.29",
