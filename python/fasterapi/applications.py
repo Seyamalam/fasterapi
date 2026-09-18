@@ -286,7 +286,24 @@ class FastAPI(Starlette):
 
             workers = kw.pop("workers", 0) or None
             print(f"fasterapi: serving on http://{host}:{port} via Rust Hyper host", flush=True)
-            serve_asgi(self, host, port, workers)
+            # Rust owns SIGINT/SIGTERM during serve (graceful drain). Neutralize
+            # Python's competing disposition so Ctrl-C can't surface as a stray
+            # KeyboardInterrupt mid-shutdown; restored afterwards.
+            import signal as _signal
+
+            try:
+                _prev_int = _signal.getsignal(_signal.SIGINT)
+                _signal.signal(_signal.SIGINT, lambda *_a: None)
+            except Exception:
+                _prev_int = None
+            try:
+                serve_asgi(self, host, port, workers)
+            finally:
+                if _prev_int is not None:
+                    try:
+                        _signal.signal(_signal.SIGINT, _prev_int)
+                    except Exception:
+                        pass
             return
         import uvicorn
 

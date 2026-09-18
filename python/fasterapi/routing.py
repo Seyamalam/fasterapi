@@ -525,6 +525,20 @@ async def _solve_fn_kwargs(
                 kwargs[pname] = val
             continue
 
+        # --- Bare dict/list without marker -> body (FastAPI rule) --------------
+        # `payload: dict` takes the whole JSON body; `payload: list` (and
+        # tuple/set) is embedded by field name, exactly like FastAPI.
+        if ann in (dict, list, tuple, set, frozenset) and default is inspect.Parameter.empty:
+            val, errs = _resolve_body_param(
+                pname, ann, None, body_json, form, request, body_raw,
+                force_embed=ann is not dict,
+            )
+            if errs:
+                errors.extend(errs)
+            else:
+                kwargs[pname] = val
+            continue
+
         # --- Path fallback (name appears in path) ------------------------------
         if pname in path_params:
             val, err = _validate_value(["path", pname], path_params[pname], ann, None)
@@ -591,6 +605,7 @@ def _resolve_body_param(
     form: Optional[dict[str, Any]],
     request: Request,
     body_raw: Optional[bytes] = None,
+    force_embed: bool = False,
 ) -> tuple[Any, list[dict[str, Any]]]:
     no: list[dict[str, Any]] = []
     # File / UploadFile
@@ -620,7 +635,7 @@ def _resolve_body_param(
         return None, [_missing(["body", alias])]
 
     # JSON body
-    embed = bool(meta.embed) if meta else False
+    embed = force_embed or bool(meta.embed) if meta else force_embed
     alias = (meta.alias if meta else None) or pname
     # Fast path: single Pydantic model takes the whole raw payload through
     # `validate_json` — one Rust pass (parse + validate), no intermediate dict.
