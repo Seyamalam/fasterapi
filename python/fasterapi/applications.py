@@ -22,6 +22,7 @@ from .dag import CompiledDAG, compile_app_dag
 from .exceptions import HTTPException, RequestValidationError
 from .params import Depends
 from .routing import APIRouter
+from .utils import generate_unique_id as _unique_id
 
 
 class FastAPI(Starlette):
@@ -263,6 +264,7 @@ class FastAPI(Starlette):
             op: dict[str, Any] = {
                 "summary": r.summary or r.name,
                 "description": r.description or "",
+                "operationId": _unique_id(r),
                 "tags": r.tags,
                 "parameters": params,
                 "responses": {str(r.status_code): {"description": "Successful Response"}},
