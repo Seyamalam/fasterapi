@@ -1168,9 +1168,18 @@ fn serve_asgi(
         builder.worker_threads(n.max(1));
     }
     let rt = builder.build().map_err(py_runtime_error)?;
-    let pool_size = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
+    // Python worker pool: smaller than CPU count reduces GIL thrash for
+    // validation-heavy handlers on GIL builds; override with FASTERAPI_POOL.
+    // (Free-threaded builds want this high; GIL builds want it low.)
+    let pool_size = std::env::var("FASTERAPI_POOL")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+        });
     let pool = std::sync::Arc::new(PyWorkerPool::new(pool_size));
     py.allow_threads(|| run_until_ctrl_c(rt, app, host.to_string(), port, pool))
         .map_err(py_runtime_error)
