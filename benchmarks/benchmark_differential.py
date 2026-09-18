@@ -306,7 +306,9 @@ def main() -> int:
                 print(f"[{label}] RPS={summary['rps']} "
                       f"p50={summary['p50_ms']}ms p90={summary['p90_ms']}ms p99={summary['p99_ms']}ms "
                       f"rss={summary['rss_bytes'] / 1e6:.1f}MB")
-                result.setdefault("macro", {})[label] = summary
+                if result.get("macro") is None:
+                    result["macro"] = {}
+                result["macro"][label] = summary
 
             macro = result["macro"]
             rps_a = macro["fastapi+uvicorn"]["rps"] or 1.0

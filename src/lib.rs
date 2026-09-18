@@ -129,9 +129,8 @@ fn fast_json_loads(py: Python<'_>, payload: &str) -> PyResult<PyObject> {
     let value: serde_json::Value = py
         .allow_threads(|| {
             let mut bytes = payload.as_bytes().to_vec();
-            simd_json::from_slice::<serde_json::Value>(&mut bytes).or_else(|_| {
-                serde_json::from_str::<serde_json::Value>(payload)
-            })
+            simd_json::from_slice::<serde_json::Value>(&mut bytes)
+                .or_else(|_| serde_json::from_str::<serde_json::Value>(payload))
         })
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
     Ok(value_to_py(py, &value))
@@ -179,7 +178,10 @@ fn fastapi_to_matchit(pattern: &str) -> String {
                 }
                 name.push(nc);
             }
-            let clean: String = name.chars().filter(|ch| ch.is_alphanumeric() || *ch == '_').collect();
+            let clean: String = name
+                .chars()
+                .filter(|ch| ch.is_alphanumeric() || *ch == '_')
+                .collect();
             if clean.is_empty() {
                 out.push_str(":param");
             } else {
@@ -224,25 +226,25 @@ impl RustRouter {
             .write()
             .insert(&converted, target)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-        self.count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
     /// Match a path. Returns `(target, params_dict)` or `None`.
     fn r#match(&self, py: Python<'_>, path: &str) -> PyResult<Option<(String, PyObject)>> {
         // Clone out the match under the lock, build Python objects after.
-        let found: Option<(String, Vec<(String, String)>)> =
-            py.allow_threads(|| {
-                let router = self.inner.read();
-                router.at(path).ok().map(|m| {
-                    let params = m
-                        .params
-                        .iter()
-                        .map(|(k, v)| (k.to_string(), v.to_string()))
-                        .collect();
-                    (m.value.clone(), params)
-                })
-            });
+        let found: Option<(String, Vec<(String, String)>)> = py.allow_threads(|| {
+            let router = self.inner.read();
+            router.at(path).ok().map(|m| {
+                let params = m
+                    .params
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect();
+                (m.value.clone(), params)
+            })
+        });
         match found {
             None => Ok(None),
             Some((target, params)) => {
@@ -288,10 +290,11 @@ impl TokenBucket {
         let per_second_nz = NonZeroU32::new(per_second.max(1))
             .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("per_second must be >= 1"))?;
         let burst_size = burst.unwrap_or(per_second_nz.get()).max(1);
-        let quota = governor::Quota::per_second(per_second_nz).allow_burst(
-            NonZeroU32::new(burst_size)
-                .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("burst must be >= 1"))?,
-        );
+        let quota =
+            governor::Quota::per_second(per_second_nz)
+                .allow_burst(NonZeroU32::new(burst_size).ok_or_else(|| {
+                    pyo3::exceptions::PyValueError::new_err("burst must be >= 1")
+                })?);
         Ok(Self {
             limiter: Arc::new(governor::RateLimiter::direct(quota)),
             per_second: per_second_nz.get() as f64,
@@ -461,7 +464,11 @@ fn process_rss_bytes() -> u64 {
         }
         // Fallback: statm pages * page size.
         if let Ok(statm) = std::fs::read_to_string("/proc/self/statm") {
-            if let Some(pages) = statm.split_whitespace().nth(1).and_then(|n| n.parse::<u64>().ok()) {
+            if let Some(pages) = statm
+                .split_whitespace()
+                .nth(1)
+                .and_then(|n| n.parse::<u64>().ok())
+            {
                 return pages * 4096;
             }
         }
@@ -529,7 +536,13 @@ fn err_value(msg: String) -> pyo3::PyErr {
     pyo3::exceptions::PyValueError::new_err(msg)
 }
 
-fn check_int_range(v: i64, ge: Option<i64>, le: Option<i64>, gt: Option<i64>, lt: Option<i64>) -> Result<(), String> {
+fn check_int_range(
+    v: i64,
+    ge: Option<i64>,
+    le: Option<i64>,
+    gt: Option<i64>,
+    lt: Option<i64>,
+) -> Result<(), String> {
     if let Some(lo) = ge {
         if v < lo {
             return Err(format!("Input should be greater than or equal to {lo}"));
@@ -553,7 +566,13 @@ fn check_int_range(v: i64, ge: Option<i64>, le: Option<i64>, gt: Option<i64>, lt
     Ok(())
 }
 
-fn check_float_range(v: f64, ge: Option<f64>, le: Option<f64>, gt: Option<f64>, lt: Option<f64>) -> Result<(), String> {
+fn check_float_range(
+    v: f64,
+    ge: Option<f64>,
+    le: Option<f64>,
+    gt: Option<f64>,
+    lt: Option<f64>,
+) -> Result<(), String> {
     if let Some(lo) = ge {
         if v < lo {
             return Err(format!("Input should be greater than or equal to {lo}"));
@@ -580,7 +599,14 @@ fn check_float_range(v: f64, ge: Option<f64>, le: Option<f64>, gt: Option<f64>, 
 /// Strict, type-safe int coercion + range checks. Raises `ValueError` on failure.
 #[pyfunction]
 #[pyo3(signature = (raw, ge=None, le=None, gt=None, lt=None))]
-fn validate_int(py: Python<'_>, raw: &str, ge: Option<i64>, le: Option<i64>, gt: Option<i64>, lt: Option<i64>) -> PyResult<i64> {
+fn validate_int(
+    py: Python<'_>,
+    raw: &str,
+    ge: Option<i64>,
+    le: Option<i64>,
+    gt: Option<i64>,
+    lt: Option<i64>,
+) -> PyResult<i64> {
     let v: i64 = py
         .allow_threads(|| {
             let s = raw.trim();
@@ -591,10 +617,14 @@ fn validate_int(py: Python<'_>, raw: &str, ge: Option<i64>, le: Option<i64>, gt:
             // Allow leading +/- then ASCII digits only (no underscores, no hex).
             let body = s.strip_prefix(['+', '-']).unwrap_or(s);
             if body.is_empty() || !body.bytes().all(|b| b.is_ascii_digit()) {
-                return Err("Input should be a valid integer, unable to parse string as an integer".to_string());
+                return Err(
+                    "Input should be a valid integer, unable to parse string as an integer"
+                        .to_string(),
+                );
             }
-            s.parse::<i64>()
-                .map_err(|_| "Input should be a valid integer, unable to parse string as an integer".to_string())
+            s.parse::<i64>().map_err(|_| {
+                "Input should be a valid integer, unable to parse string as an integer".to_string()
+            })
         })
         .map_err(err_value)?;
     check_int_range(v, ge, le, gt, lt).map_err(err_value)?;
@@ -604,14 +634,23 @@ fn validate_int(py: Python<'_>, raw: &str, ge: Option<i64>, le: Option<i64>, gt:
 /// Type-safe float coercion + range checks.
 #[pyfunction]
 #[pyo3(signature = (raw, ge=None, le=None, gt=None, lt=None))]
-fn validate_float(py: Python<'_>, raw: &str, ge: Option<f64>, le: Option<f64>, gt: Option<f64>, lt: Option<f64>) -> PyResult<f64> {
+fn validate_float(
+    py: Python<'_>,
+    raw: &str,
+    ge: Option<f64>,
+    le: Option<f64>,
+    gt: Option<f64>,
+    lt: Option<f64>,
+) -> PyResult<f64> {
     let v: f64 = py
         .allow_threads(|| {
             let s = raw.trim();
             if s.is_empty() {
                 return Err("Input should be a valid number".to_string());
             }
-            s.parse::<f64>().map_err(|_| "Input should be a valid number, unable to parse string as a number".to_string())
+            s.parse::<f64>().map_err(|_| {
+                "Input should be a valid number, unable to parse string as a number".to_string()
+            })
         })
         .map_err(err_value)?;
     if !v.is_finite() {
@@ -655,8 +694,7 @@ fn validate_str(
             }
         }
         if let Some(pat) = pattern {
-            let re = regex::Regex::new(pat)
-                .map_err(|e| format!("Invalid pattern {pat:?}: {e}"))?;
+            let re = regex::Regex::new(pat).map_err(|e| format!("Invalid pattern {pat:?}: {e}"))?;
             if !re.is_match(raw) {
                 return Err(format!("String should match pattern {pat:?}"));
             }

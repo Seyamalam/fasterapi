@@ -3,13 +3,28 @@
 set -euo pipefail
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
-PY="${FASTERAPI_PY:-python3}"
+# Prefer the project venv when present, else $VIRTUAL_ENV, else system python.
+if [[ -n "${FASTERAPI_PY:-}" ]]; then
+  PY="$FASTERAPI_PY"
+elif [[ -x "$ROOT/.venv/bin/python" ]]; then
+  PY="$ROOT/.venv/bin/python"
+elif [[ -n "${VIRTUAL_ENV:-}" && -x "$VIRTUAL_ENV/bin/python" ]]; then
+  PY="$VIRTUAL_ENV/bin/python"
+else
+  PY="python3"
+fi
 
-echo "=== fasterapi pre-commit ==="
-# Rust formatting (advisory — never blocks when toolchain is busy)
+echo "=== fasterapi pre-commit ($PY) ==="
+# Rust formatting (advisory — never blocks).
 if command -v cargo >/dev/null 2>&1; then
   cargo fmt --check 2>/dev/null || echo "  (cargo fmt: differences found — run 'cargo fmt')"
 fi
 # Fast native unit tests only; full differential suite runs on pre-push.
-"$PY" -m pytest tests/test_fasterapi_native.py -q
+# Skip (advisory) when optional test deps aren't installed yet.
+if ! PYTHONPATH="$ROOT/python" "$PY" -c "import fastapi, starlette" 2>/dev/null; then
+  echo "  (test deps missing — skipping pytest; run scripts/quickstart.sh)"
+  echo "=== pre-commit OK (advisory) ==="
+  exit 0
+fi
+PYTHONPATH="$ROOT/python" "$PY" -m pytest tests/test_fasterapi_native.py -q
 echo "=== pre-commit OK ==="
