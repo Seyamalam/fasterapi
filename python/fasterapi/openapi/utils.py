@@ -104,6 +104,67 @@ def _strip_null_defaults(node: Any) -> None:
             _strip_null_defaults(value)
 
 
+def _scheme_name(scheme: Any) -> str:
+    return getattr(scheme, "scheme_name", None) or type(scheme).__name__
+
+
+def _scheme_json(scheme: Any) -> dict[str, Any]:
+    """OpenAPI security-scheme object mirroring FastAPI's emission."""
+    from ..security import APIKeyBase, HTTPBase, OAuth2, OpenIdConnect
+
+    out: dict[str, Any] = {}
+    if isinstance(scheme, OAuth2):
+        flows = {}
+        for flow_name, flow in (getattr(scheme, "flows", None) or {}).items():
+            flows[flow_name] = {k: v for k, v in flow.items() if v is not None}
+        out = {"type": "oauth2", "flows": flows}
+    elif isinstance(scheme, APIKeyBase):
+        out = {"type": "apiKey", "in": scheme.openapi_in, "name": scheme.name}
+    elif isinstance(scheme, HTTPBase):
+        out = {"type": "http", "scheme": (scheme.scheme or "").lower()}
+        if getattr(scheme, "bearerFormat", None):
+            out["bearerFormat"] = scheme.bearerFormat
+    elif isinstance(scheme, OpenIdConnect):
+        out = {"type": "openIdConnect", "openIdConnectUrl": scheme.openIdConnectUrl}
+    else:  # pragma: no cover - unknown custom scheme
+        out = {"type": "http", "scheme": "bearer"}
+    if getattr(scheme, "description", None):
+        out["description"] = scheme.description
+    return out
+
+
+def _route_security(route: Any, endpoint: Any, security_schemes: dict[str, Any]) -> list[dict[str, list[str]]]:
+    """Collect (scheme, scopes) pairs from endpoint + route dependencies."""
+    from ..params import Depends, Security
+    from ..routing import _signature
+    from ..security import SecurityBase
+
+    found: list[tuple[Any, list[str]]] = []
+
+    def _scan(marker: Any) -> None:
+        dep = getattr(marker, "dependency", None)
+        if isinstance(dep, SecurityBase):
+            scopes = list(getattr(marker, "scopes", None) or [])
+            found.append((dep, scopes))
+
+    for dep in list(getattr(route, "dependencies", None) or []):
+        _scan(dep)
+    try:
+        sig = _signature(endpoint) or inspect.signature(endpoint)
+    except (TypeError, ValueError):
+        sig = None
+    if sig is not None:
+        for param in sig.parameters.values():
+            if isinstance(param.default, (Depends, Security)):
+                _scan(param.default)
+    requirements: list[dict[str, list[str]]] = []
+    for scheme, scopes in found:
+        name = _scheme_name(scheme)
+        security_schemes.setdefault(name, _scheme_json(scheme))
+        requirements.append({name: scopes})
+    return requirements
+
+
 def get_openapi(
     *,
     title: str,
@@ -112,13 +173,15 @@ def get_openapi(
     description: str = "",
     routes: list[Any],
     openapi_prefix: str = "",
+    servers: Optional[list[dict[str, Any]]] = None,
     **_extra: Any,
 ) -> dict[str, Any]:
     from ..params import Depends, Param
-    from ..routing import _ann_of, _is_pydantic_model
+    from ..routing import _ann_of, _is_pydantic_model, _signature
 
     paths: dict[str, Any] = {}
     components: dict[str, Any] = {}
+    security_schemes: dict[str, Any] = {}
     for route in routes:
         endpoint = getattr(route, "endpoint", None)
         if endpoint is None:
@@ -226,6 +289,11 @@ def get_openapi(
                 "content": {"application/json": {"schema": {"$ref": "#/components/schemas/HTTPValidationError"}}},
             }
         op["responses"] = responses
+        # Security: schemes referenced by Depends()/Security() on the endpoint
+        # or the route produce components + per-operation requirements.
+        op_security = _route_security(route, endpoint, security_schemes)
+        if op_security:
+            op["security"] = op_security
         for m in methods:
             item[m] = op
     doc: dict[str, Any] = {
@@ -235,8 +303,14 @@ def get_openapi(
     }
     if description:
         doc["info"]["description"] = description
-    if components:
-        doc["components"] = {"schemas": components}
+    if servers:
+        doc["servers"] = servers
+    if components or security_schemes:
+        doc["components"] = {}
+        if components:
+            doc["components"]["schemas"] = components
+        if security_schemes:
+            doc["components"]["securitySchemes"] = security_schemes
     return doc
 
 

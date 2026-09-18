@@ -318,6 +318,8 @@ class HTTPDigest(HTTPBase):
 # ------------------------------------------------------------ API key ---
 
 class APIKeyBase(SecurityBase):
+    openapi_in: str = "header"
+
     def __init__(
         self,
         *,
@@ -343,15 +345,21 @@ class APIKeyBase(SecurityBase):
 
 
 class APIKeyQuery(APIKeyBase):
+    openapi_in: str = "query"
+
     async def __call__(self, request: Request) -> Optional[str]:
         return self.check_api_key(request.query_params.get(self.name))
 
 
 class APIKeyHeader(APIKeyBase):
+    openapi_in: str = "header"
+
     async def __call__(self, request: Request) -> Optional[str]:
         return self.check_api_key(request.headers.get(self.name))
 
 
 class APIKeyCookie(APIKeyBase):
+    openapi_in: str = "cookie"
+
     async def __call__(self, request: Request) -> Optional[str]:
         return self.check_api_key(request.cookies.get(self.name))

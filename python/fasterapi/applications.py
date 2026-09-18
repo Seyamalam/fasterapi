@@ -43,6 +43,7 @@ class FastAPI(Starlette):
         openapi_url: Optional[str] = "/openapi.json",
         swagger_ui_oauth2_redirect_url: Optional[str] = "/docs/oauth2-redirect",
         swagger_ui_parameters: Optional[dict[str, Any]] = None,
+        servers: Optional[list[dict[str, Any]]] = None,
         **extra: Any,
     ) -> None:
         super().__init__(lifespan=lifespan, middleware=middleware)  # type: ignore[call-arg]
@@ -54,6 +55,7 @@ class FastAPI(Starlette):
         self.title = title
         self.version = version
         self.description = description
+        self.servers = servers
         self.docs_url = docs_url
         self.redoc_url = redoc_url
         self.openapi_url = openapi_url
@@ -234,6 +236,7 @@ class FastAPI(Starlette):
             version=self.version,
             description=self.description,
             routes=self._router.routes,
+            servers=self.servers,
         )
 
     # -- Phase-2: AOT build ------------------------------------------------------

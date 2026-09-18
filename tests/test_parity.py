@@ -481,6 +481,34 @@ def test_openapi_full_equality():
     assert build(GFastAPI).openapi() == build(F.FastAPI).openapi()
 
 
+def test_openapi_security_and_servers():
+    from fasterapi import Security as _FS
+    from fasterapi.security import HTTPBearer as _FHB
+    from fasterapi.security import OAuth2PasswordBearer as _FO
+    from fastapi import Security as _GS
+    from fastapi.security import HTTPBearer as _GHB
+    from fastapi.security import OAuth2PasswordBearer as _GO
+
+    def build(cls, O, H, D, S):  # type: ignore[no-untyped-def]
+        app = cls(title="T", version="1", servers=[{"url": "https://x.example"}])
+        o = O(tokenUrl="t", scheme_name="my-oauth", scopes={"read": "r"})
+        b = H(bearerFormat="JWT")
+
+        @app.get("/a")
+        def a(t: str = S(o, scopes=["read"])):
+            return {}
+
+        @app.get("/b")
+        def bb(t=D(b)):
+            return {}
+
+        return app
+
+    g = build(GFastAPI, _GO, _GHB, GDepends, _GS)
+    f = build(F.FastAPI, _FO, _FHB, FDepends, _FS)
+    assert g.openapi() == f.openapi()
+
+
 def test_websocket_echo_parity():
     g_app = GFastAPI()
 
