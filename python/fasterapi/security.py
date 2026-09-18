@@ -138,8 +138,9 @@ class OpenIdConnect(SecurityBase):
         self.auto_error = auto_error
 
     async def __call__(self, request: Request) -> Optional[str]:
+        # OpenID Connect returns the whole Authorization header (FastAPI parity).
         authorization = request.headers.get("Authorization")
-        scheme, param = get_authorization_scheme_param(authorization)
+        scheme, _param = get_authorization_scheme_param(authorization)
         if not authorization or scheme.lower() != "bearer":
             if self.auto_error:
                 raise HTTPException(
@@ -148,7 +149,7 @@ class OpenIdConnect(SecurityBase):
                     headers={"WWW-Authenticate": "Bearer"},
                 )
             return None
-        return param
+        return authorization
 
 
 class OAuth2PasswordRequestForm:
@@ -157,7 +158,7 @@ class OAuth2PasswordRequestForm:
     def __init__(
         self,
         *,
-        grant_type: str = Form(default=""),
+        grant_type: Optional[str] = Form(default=None, pattern="^password$"),
         username: str = Form(),
         password: str = Form(),
         scope: str = Form(default=""),

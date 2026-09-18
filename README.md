@@ -120,7 +120,7 @@ pytest tests/ -q
 |---|---|---|
 | Differential (`tests/test_parity.py`, FastAPI vs fasterapi) | 16 | all passing |
 | Native (`tests/test_fasterapi_native.py`) | 6 | all passing |
-| **Total** | **22** | **22 passed** |
+| **Total** | **22** | **29 passed** |
 
 Coverage: ping, path/query/header/cookie params, validation shapes (422 `loc`/`type`), JSON body + `response_model`, Form, file upload, DI order + `yield` teardown, `HTTPException`, custom handlers, router prefixes, OpenAPI shapes, websockets, guards, DAG, Rust bridge.
 <!-- PARITY:END -->
@@ -256,9 +256,9 @@ Micro fast-paths (in-process, no servers):
 
 | Check | Baseline | fasterapi | Speedup |
 |---|---|---|---|
-| JSON `loads` | 0.0367s stdlib | 0.0651s SIMD | x0.56 |
-| JSON `dumps` | stdlib | Rust bridge | x0.79 |
-| Router match | 0.2723s Python | 0.0834s `matchit` | x3.27 |
+| JSON `loads` | 0.0364s stdlib | 0.0642s SIMD | x0.57 |
+| JSON `dumps` | stdlib | Rust bridge | x0.92 |
+| Router match | 0.272s Python | 0.0835s `matchit` | x3.26 |
 
 Macro load (loopback, httpx concurrency; last full run):
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import inspect
 import json as _stdlib_json
+import sys
 from contextlib import AsyncExitStack
 from typing import Any, Callable, Coroutine, Optional, Union, get_origin
 
@@ -72,9 +73,15 @@ def _ann_of(fn: Callable[..., Any], pname: str, raw_ann: Any) -> Any:
         return hints[pname]
     if isinstance(raw_ann, str):
         # Last resort: evaluate in the endpoint's module globals (covers
-        # `Optional[X]`, `X | None`, `list[X]` written as strings).
+        # `Optional[X]`, `X | None`, `list[X]` written as strings). Callable
+        # *instances* (security schemes) have no __globals__, so fall back to
+        # their class's module namespace.
+        ns = getattr(fn, "__globals__", None)
+        if ns is None:
+            mod = sys.modules.get(getattr(type(fn), "__module__", ""), None)
+            ns = getattr(mod, "__dict__", {})
         try:
-            return eval(raw_ann, getattr(fn, "__globals__", {}), {})  # noqa: S307
+            return eval(raw_ann, ns, {})  # noqa: S307
         except Exception:
             pass
     return raw_ann
@@ -95,6 +102,11 @@ def _parse_bool(v: str) -> Union[bool, str]:
     return v  # let pydantic raise
 
 
+def _missing(loc: list[str]) -> dict[str, Any]:
+    """Exact FastAPI wire shape for a missing field (input is null)."""
+    return {"loc": loc, "msg": "Field required", "type": "missing", "input": None}
+
+
 def _check_constraints(name: str, loc: list[str], value: Any, meta: Optional[Param]) -> Optional[dict[str, Any]]:
     if meta is None or value is None:
         return None
@@ -110,7 +122,8 @@ def _check_constraints(name: str, loc: list[str], value: Any, meta: Optional[Par
 
             if not re.search(meta.pattern, value):
                 return {"loc": loc, "msg": f"String should match pattern '{meta.pattern}'",
-                        "type": "string_pattern_mismatch", "input": value}
+                        "type": "string_pattern_mismatch", "input": value,
+                        "ctx": {"pattern": meta.pattern}}
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         if meta.ge is not None and value < meta.ge:
             return {"loc": loc, "msg": f"Input should be greater than or equal to {meta.ge}",
@@ -208,8 +221,11 @@ def _validate_value(loc: list[str], raw: Any, annotation: Any, meta: Optional[Pa
             # Strip Rust `ValueError: ` prefix if present.
             if ": " in msg and msg.split(": ", 1)[0].endswith("Error"):
                 msg = msg.split(": ", 1)[1]
-            return None, {"loc": loc, "msg": msg,
-                          "type": _rust_error_type(msg, ann), "input": raw}
+            err_type = _rust_error_type(msg, ann)
+            err: dict[str, Any] = {"loc": loc, "msg": msg, "type": err_type, "input": raw}
+            if err_type == "string_pattern_mismatch" and meta and meta.pattern:
+                err["ctx"] = {"pattern": meta.pattern}
+            return None, err
     # bool query strings need normalization before pydantic
     if ann is bool and isinstance(raw, str):
         parsed = _parse_bool(raw)
@@ -272,7 +288,11 @@ async def _call_with_teardown(fn: Callable[..., Any], kwargs: dict[str, Any], st
         return value
     if inspect.iscoroutinefunction(fn):
         return await fn(**kwargs)
-    return fn(**kwargs)
+    # Instances with async __call__ (security schemes), partials, sync fns.
+    result = fn(**kwargs)
+    if inspect.isawaitable(result):
+        return await result
+    return result
 
 
 async def _solve_fn_kwargs(
@@ -297,6 +317,10 @@ async def _solve_fn_kwargs(
     kwargs: dict[str, Any] = {}
     errors: list[dict[str, Any]] = []
     for pname, param in sig.parameters.items():
+        # Unbound dunder initializers (`SomeForm.__init__`) carry `self`;
+        # it is never a request parameter.
+        if pname in ("self", "cls") and getattr(fn, "__name__", "") in ("__init__", "__new__"):
+            continue
         ann = _ann_of(fn, pname, param.annotation)
         default = param.default
 
@@ -327,7 +351,7 @@ async def _solve_fn_kwargs(
                 if inspect.isclass(ann) or inspect.isfunction(ann):
                     dep_fn = ann
                 else:
-                    errors.append({"loc": ["query", pname], "msg": "Field required", "type": "missing"})
+                    errors.append(_missing(["query", pname]))
                     continue
             cache_key = id(dep_fn)
             if default.use_cache and cache_key in cache:
@@ -371,7 +395,7 @@ async def _solve_fn_kwargs(
                     if meta.has_default() and meta.default is not Ellipsis:
                         kwargs[pname] = meta.default
                         continue
-                    errors.append({"loc": ["path", pname], "msg": "Field required", "type": "missing"})
+                    errors.append(_missing(["path", pname]))
                     continue
                 val, err = _validate_value(["path", pname], raw, ann, meta)
                 if err:
@@ -406,7 +430,7 @@ async def _solve_fn_kwargs(
                     if meta.has_default() and meta.default is not Ellipsis:
                         kwargs[pname] = meta.default
                     elif param.default is inspect.Parameter.empty and meta.required:
-                        errors.append({"loc": ["query", alias], "msg": "Field required", "type": "missing"})
+                        errors.append(_missing(["query", alias]))
                     elif meta.has_default():
                         kwargs[pname] = meta.default
                     else:
@@ -418,7 +442,7 @@ async def _solve_fn_kwargs(
                     if meta.has_default() and meta.default is not Ellipsis:
                         kwargs[pname] = meta.default
                     elif meta.required and param.default is inspect.Parameter.empty:
-                        errors.append({"loc": ["header", alias], "msg": "Field required", "type": "missing"})
+                        errors.append(_missing(["header", alias]))
                     else:
                         kwargs[pname] = meta.default if meta.has_default() else None
                 else:
@@ -433,7 +457,7 @@ async def _solve_fn_kwargs(
                     if meta.has_default() and meta.default is not Ellipsis:
                         kwargs[pname] = meta.default
                     elif meta.required and param.default is inspect.Parameter.empty:
-                        errors.append({"loc": ["cookie", alias], "msg": "Field required", "type": "missing"})
+                        errors.append(_missing(["cookie", alias]))
                     else:
                         kwargs[pname] = meta.default if meta.has_default() else None
                 else:
@@ -483,7 +507,7 @@ async def _solve_fn_kwargs(
             kwargs[pname] = default
             continue
         # Required: decide loc — query by default (FastAPI behavior)
-        errors.append({"loc": ["query", pname], "msg": "Field required", "type": "missing"})
+        errors.append(_missing(["query", pname]))
 
     if errors:
         raise RequestValidationError(errors)
@@ -538,12 +562,12 @@ def _resolve_body_param(
         alias = (meta.alias if meta else None) or pname
         if form is not None and alias in form:
             return form[alias], no
-        return None, [{"loc": ["body", pname], "msg": "Field required", "type": "missing"}]
+        return None, [_missing(["body", pname])]
     if meta is not None and meta.in_ == "file":
         alias = meta.alias or pname
         if form is not None and (pname in form or alias in form):
             return form.get(pname, form.get(alias)), no
-        return None, [{"loc": ["body", alias], "msg": "Field required", "type": "missing"}]
+        return None, [_missing(["body", alias])]
     if meta is not None and meta.in_ == "form":
         alias = meta.alias or pname
         if form is not None and (pname in form or alias in form):
@@ -554,7 +578,7 @@ def _resolve_body_param(
             return (val, no) if err is None else (None, [err])
         if meta.has_default() and meta.default is not Ellipsis:
             return meta.default, no
-        return None, [{"loc": ["body", alias], "msg": "Field required", "type": "missing"}]
+        return None, [_missing(["body", alias])]
 
     # JSON body
     embed = bool(meta.embed) if meta else False
@@ -571,8 +595,7 @@ def _resolve_body_param(
         if has_default:
             return dflt, no
         # Optional[X] (default None in signature handled by caller); here required.
-        return None, [{"loc": ["body", alias if embed else pname],
-                       "msg": "Field required", "type": "missing"}]
+        return None, [_missing(["body", alias if embed else pname])]
     # Fast path: single Pydantic model takes the whole raw payload through
     # `validate_json` — one Rust pass (parse + validate), no intermediate dict.
     if _is_pydantic_model(ann) and not embed and body_raw:
@@ -590,7 +613,7 @@ def _resolve_body_param(
     if payload is _MISSING:
         if meta is not None and meta.has_default() and meta.default is not Ellipsis:
             return meta.default, no
-        return None, [{"loc": ["body", alias], "msg": "Field required", "type": "missing"}]
+        return None, [_missing(["body", alias])]
     if ann is inspect.Parameter.empty or ann is Any:
         return payload, no
     try:
