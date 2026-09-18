@@ -882,6 +882,18 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 
+/// Boxed response body: buffered (`Full`) or file-streamed (`StreamBody`).
+type RespBody = http_body_util::combinators::BoxBody<
+    Bytes,
+    Box<dyn std::error::Error + Send + Sync>,
+>;
+
+fn boxed_full(bytes: Bytes) -> RespBody {
+    Full::new(bytes)
+        .map_err(|never| -> Box<dyn std::error::Error + Send + Sync> { match never {} })
+        .boxed()
+}
+
 const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 /// Per-worker queue depth: backpressure overflows to `spawn_blocking`.
 const POOL_QUEUE: usize = 64;
@@ -898,6 +910,9 @@ struct PyJob {
     query: String,
     headers: Vec<(String, Vec<u8>)>,
     body: Vec<u8>,
+    /// False when the request had a `Range` header (sendfile skipped so
+    /// partial-content semantics stay exactly Starlette's).
+    sendfile_ok: bool,
     reply: tokio::sync::oneshot::Sender<Result<(u16, Vec<(String, String)>, Vec<u8>), String>>,
 }
 
@@ -917,7 +932,15 @@ fn run_py_job(job: PyJob) {
         let ret = helper
             .getattr("run_request")
             .map_err(|e| e.to_string())?
-            .call1((job.app, job.method, job.path, job.query, py_headers, py_body))
+            .call1((
+                job.app,
+                job.method,
+                job.path,
+                job.query,
+                py_headers,
+                py_body,
+                job.sendfile_ok,
+            ))
             .map_err(|e| e.to_string())?;
         ret.extract::<(u16, Vec<(String, String)>, Vec<u8>)>()
             .map_err(|e| e.to_string())
@@ -993,13 +1016,17 @@ async fn serve_one(
     pool: &PyWorkerPool,
     app: PyObject,
     req: Request<hyper::body::Incoming>,
-) -> Result<Response<Full<Bytes>>, hyper::Error> {
+) -> Result<Response<RespBody>, hyper::Error> {
     let method = req.method().to_string();
     let uri = req.uri().clone();
     let path = uri.path().to_string();
     let query = uri.query().unwrap_or("").to_string();
     let mut headers: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut has_range = false;
     for (name, value) in req.headers() {
+        if name == hyper::header::RANGE {
+            has_range = true;
+        }
         headers.push((name.to_string(), value.as_bytes().to_vec()));
     }
     let collected = req.collect().await?;
@@ -1007,7 +1034,7 @@ async fn serve_one(
     if body.len() > MAX_BODY_BYTES {
         let resp = Response::builder()
             .status(StatusCode::PAYLOAD_TOO_LARGE)
-            .body(Full::new(Bytes::from_static(b"Request body too large")))
+            .body(boxed_full(Bytes::from_static(b"Request body too large")))
             .unwrap();
         return Ok(resp);
     }
@@ -1023,6 +1050,7 @@ async fn serve_one(
         headers,
         body,
         reply: tx,
+        sendfile_ok: !has_range,
     };
     // Bounded pool first; overflow degrades to spawn_blocking instead of
     // deadlocking when every worker queue is momentarily full.
@@ -1055,14 +1083,22 @@ async fn serve_one(
     let mut builder = Response::builder().status(
         StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
     );
+    let sendfile_path: Option<String> = resp_headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("x-fasterapi-sendfile"))
+        .map(|(_, v)| v.clone());
     for (k, v) in &resp_headers {
         // Skip hop-by-hop / framing headers the server owns (`server` is
         // re-stamped below — the app layer still thinks in uvicorn terms).
+        // content-length IS forwarded: Starlette computed it over the exact
+        // bytes we send (sendfile sets its own from disk metadata instead).
+        // Internal `x-fasterapi-*` plan headers never leave the server.
         let kl = k.to_ascii_lowercase();
-        if kl == "content-length"
-            || kl == "transfer-encoding"
+        if kl == "transfer-encoding"
             || kl == "connection"
             || kl == "server"
+            || kl.starts_with("x-fasterapi-")
+            || (kl == "content-length" && sendfile_path.is_some())
         {
             continue;
         }
@@ -1073,13 +1109,41 @@ async fn serve_one(
             builder = builder.header(name, value);
         }
     }
-    Ok(builder
-        .header("server", "fasterapi-hyper")
-        .body(Full::new(Bytes::from(resp_body)))
-        .unwrap())
+    builder = builder.header("server", "fasterapi-hyper");
+    // Zero-copy file streaming: the app already sent content headers; the
+    // bytes flow straight from disk, never through Python.
+    if let Some(path) = sendfile_path {
+        match tokio::fs::File::open(&path).await {
+            Ok(file) => {
+                if let Ok(meta) = file.metadata().await {
+                    builder = builder.header("content-length", meta.len());
+                }
+                use futures_util::TryStreamExt;
+                use http_body_util::BodyExt as _BodyExt;
+                let stream = tokio_util::io::ReaderStream::new(file)
+                    .map_ok(hyper::body::Frame::data);
+                let body = _BodyExt::map_err(
+                    http_body_util::StreamBody::new(stream),
+                    |e: std::io::Error| -> Box<dyn std::error::Error + Send + Sync> {
+                        Box::new(e)
+                    },
+                );
+                return Ok(builder.body(body.boxed()).unwrap());
+            }
+            Err(e) => {
+                eprintln!("fasterapi hyper: sendfile open {path}: {e}");
+                return Ok(builder
+                    .status(StatusCode::NOT_FOUND)
+                    .body(boxed_full(Bytes::from_static(b"Not Found")))
+                    .unwrap());
+            }
+        }
+    }
+    Ok(builder.body(boxed_full(Bytes::from(resp_body))).unwrap())
 }
 
-fn internal_error() -> (u16, Vec<(String, String)>, Vec<u8>) {    (
+fn internal_error() -> (u16, Vec<(String, String)>, Vec<u8>) {
+    (
         500u16,
         vec![("content-type".to_string(), "application/json".to_string())],
         br#"{"detail":"Internal Server Error"}"#.to_vec(),
@@ -1125,6 +1189,10 @@ fn run_until_ctrl_c(
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
             .map_err(|e| format!("bind {addr}: {e}"))?;
+        let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        #[cfg(unix)]
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .map_err(|e| format!("signal: {e}"))?;
         loop {
             tokio::select! {
                 conn = listener.accept() => {
@@ -1135,6 +1203,8 @@ fn run_until_ctrl_c(
                     // Brief GIL grab per connection for the refcount bump.
                     let app_ref = Python::with_gil(|py| app.clone_ref(py));
                     let pool = pool.clone();
+                    let in_flight = in_flight.clone();
+                    in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     tokio::spawn(async move {
                         let svc = service_fn(move |req| {
                             let app_ref = Python::with_gil(|py| app_ref.clone_ref(py));
@@ -1147,12 +1217,35 @@ fn run_until_ctrl_c(
                         {
                             eprintln!("fasterapi hyper: connection error: {e}");
                         }
+                        in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                     });
                 }
                 _ = tokio::signal::ctrl_c() => {
+                    eprintln!("fasterapi hyper: SIGINT, draining…");
+                    break;
+                }
+                _ = async {
+                    #[cfg(unix)]
+                    {
+                        sigterm.recv().await;
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
+                    eprintln!("fasterapi hyper: SIGTERM, draining…");
                     break;
                 }
             }
+        }
+        // Graceful shutdown: stop accepting, drain in-flight connections
+        // (bounded wait), then run lifespan shutdown.
+        for _ in 0..50 {
+            if in_flight.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         run_lifespan(&app, "shutdown")?;
         Ok(())

@@ -54,6 +54,12 @@ class FileResponse(_StarletteFileResponse):
 
     def __init__(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
         super().__init__(*args, **kwargs)
+        # Plan headers are hyper-host-only (env-gated) so uvicorn/TestClient
+        # byte parity stays exact everywhere else.
+        import os as _os
+
+        if _os.environ.get("FASTERAPI_HYPER") != "1":
+            return
         try:
             from . import _rust_bridge as _bridge
 
@@ -68,6 +74,34 @@ class FileResponse(_StarletteFileResponse):
                 self.headers["x-fasterapi-static-plan"] = cfg
         except Exception:
             pass
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        import os as _os
+
+        # Zero-copy lane: under the Hyper host (and only there — the env var
+        # is set solely by it), keep Starlette's exact headers/status (etag,
+        # 304/206 negotiation) but swap the body bytes for a sendfile marker
+        # the Rust layer turns into a disk stream. Range requests keep the
+        # Python path so partial-content semantics stay Starlette's.
+        if scope.get("type") == "http" and _os.environ.get("FASTERAPI_HYPER") == "1":
+            try:
+                raw = [(k.decode("latin-1").lower(), v) for k, v in scope.get("headers", [])]
+            except Exception:
+                raw = []
+            if not any(k == "range" for k, _ in raw):
+                async def _send(message: Any) -> None:
+                    mtype = message.get("type")
+                    if mtype == "http.response.start":
+                        headers = dict(message.get("headers", []))
+                        headers[b"x-fasterapi-sendfile"] = str(self.path).encode("latin-1")
+                        message = dict(message, headers=list(headers.items()))
+                    elif mtype == "http.response.body":
+                        message = dict(message, body=b"")
+                    await send(message)
+
+                await super().__call__(scope, receive, _send)
+                return
+        await super().__call__(scope, receive, send)
 
 
 __all__ = [

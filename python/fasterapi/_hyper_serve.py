@@ -21,6 +21,7 @@ from typing import Any, Optional
 from urllib.parse import unquote
 
 _LIFESPAN_CM: Any = None
+_LIFESPAN_LOOP: Any = None
 _tls = threading.local()
 
 
@@ -57,20 +58,26 @@ def _get_loop() -> asyncio.AbstractEventLoop:
 
 
 def run_lifespan(app: Any, kind: str) -> None:
-    """Run Starlette lifespan startup/shutdown around the Rust server."""
+    """Run Starlette lifespan startup/shutdown around the Rust server.
 
-    async def _go() -> None:
-        global _LIFESPAN_CM
-        if kind == "startup":
-            cm = app.router.lifespan_context(app)
-            await cm.__aenter__()
-            _LIFESPAN_CM = cm
-        else:
-            cm, _LIFESPAN_CM = _LIFESPAN_CM, None
-            if cm is not None:
-                await cm.__aexit__(None, None, None)
-
-    asyncio.run(_go())
+    One persistent loop for the whole serve lifetime: ``asyncio.run()`` per
+    call would close its loop and finalize the suspended lifespan generator,
+    making shutdown unreachable. Both calls happen on the server thread.
+    """
+    global _LIFESPAN_CM, _LIFESPAN_LOOP
+    if kind == "startup":
+        loop = asyncio.new_event_loop()
+        cm = app.router.lifespan_context(app)
+        loop.run_until_complete(cm.__aenter__())
+        _LIFESPAN_LOOP, _LIFESPAN_CM = loop, cm
+    else:
+        loop, cm = _LIFESPAN_LOOP, _LIFESPAN_CM
+        _LIFESPAN_LOOP, _LIFESPAN_CM = None, None
+        if loop is not None and cm is not None:
+            try:
+                loop.run_until_complete(cm.__aexit__(None, None, None))
+            finally:
+                loop.close()
 
 
 def run_request(
@@ -80,6 +87,7 @@ def run_request(
     query_string: str,
     headers: list[tuple[str, bytes]],
     body: bytes,
+    sendfile_ok: bool = True,
 ) -> tuple[int, list[tuple[str, str]], bytes]:
     """Drive one ASGI request to completion; return ``(status, headers, body)``."""
     raw_headers = [(name.lower().encode("latin-1"), bytes(value)) for name, value in headers]
