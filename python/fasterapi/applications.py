@@ -160,7 +160,15 @@ class FastAPI(Starlette):
                     res = await res
                 return res if isinstance(res, Response) else JSONResponse(res)
 
-        self.router.exception_handlers[exc_class] = _h  # type: ignore[attr-defined]
+        # Starlette ≥0.37 / 1.x keeps handlers on the app (not the router).
+        try:
+            super().add_exception_handler(exc_class, _h)  # type: ignore[arg-type]
+        except Exception:
+            pass
+        try:
+            self.exception_handlers[exc_class] = _h  # type: ignore[attr-defined]
+        except Exception:
+            pass
 
     async def _default_http_exception(self, request: Request, exc: HTTPException) -> Response:
         handler = self._user_exception_handlers.get(HTTPException) or self._user_exception_handlers.get(Exception)
@@ -274,7 +282,10 @@ class FastAPI(Starlette):
         import os
 
         if os.environ.get("FASTERAPI_HYPER") == "1" and _bridge.HAS_RUST:
-            from _fasterapi_rs import hyper_health  # type: ignore
+            try:
+                from ._fasterapi_rs import hyper_health  # type: ignore
+            except ImportError:
+                from _fasterapi_rs import hyper_health  # type: ignore
 
             print(hyper_health())
             print("fasterapi: Hyper host staged — falling through to uvicorn for v0.1 parity.")

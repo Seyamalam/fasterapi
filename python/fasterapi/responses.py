@@ -31,7 +31,10 @@ class FileResponse(_StarletteFileResponse):
             from . import _rust_bridge as _bridge
 
             if _bridge.HAS_RUST:
-                from _fasterapi_rs import serve_static_config  # type: ignore
+                try:
+                    from ._fasterapi_rs import serve_static_config  # type: ignore
+                except ImportError:
+                    from _fasterapi_rs import serve_static_config  # type: ignore
 
                 cfg = serve_static_config(str(self.path))
                 self.headers["x-fasterapi-serve"] = "tokio-sendfile"

@@ -14,18 +14,44 @@ import time
 from typing import Any, Optional
 
 try:  # pragma: no cover - depends on maturin build
-    from _fasterapi_rs import (  # type: ignore
-        DependencyDAG as _RsDAG,
-        RustRouter as _RsRouter,
-        TokenBucket as _RsBucket,
-        fast_json_dumps as _rs_dumps,
-        fast_json_loads as _rs_loads,
-        has_simd as _rs_has_simd,
-        hyper_health as _rs_hyper_health,
-        process_rss_bytes as _rs_rss,
-        serve_static_config as _rs_static_cfg,
-        tokio_worker_count as _rs_workers,
-    )
+    try:
+        from fasterapi._fasterapi_rs import (  # type: ignore
+            DependencyDAG as _RsDAG,
+            RustRouter as _RsRouter,
+            TokenBucket as _RsBucket,
+            fast_json_dumps as _rs_dumps,
+            fast_json_loads as _rs_loads,
+            has_simd as _rs_has_simd,
+            hyper_health as _rs_hyper_health,
+            parse_query_pairs as _rs_parse_qs,
+            percent_decode as _rs_pct_decode,
+            process_rss_bytes as _rs_rss,
+            serve_static_config as _rs_static_cfg,
+            tokio_worker_count as _rs_workers,
+            validate_bool as _rs_vbool,
+            validate_float as _rs_vfloat,
+            validate_int as _rs_vint,
+            validate_str as _rs_vstr,
+        )
+    except ImportError:  # top-level layout (pip installed ext next to package)
+        from _fasterapi_rs import (  # type: ignore
+            DependencyDAG as _RsDAG,
+            RustRouter as _RsRouter,
+            TokenBucket as _RsBucket,
+            fast_json_dumps as _rs_dumps,
+            fast_json_loads as _rs_loads,
+            has_simd as _rs_has_simd,
+            hyper_health as _rs_hyper_health,
+            parse_query_pairs as _rs_parse_qs,
+            percent_decode as _rs_pct_decode,
+            process_rss_bytes as _rs_rss,
+            serve_static_config as _rs_static_cfg,
+            tokio_worker_count as _rs_workers,
+            validate_bool as _rs_vbool,
+            validate_float as _rs_vfloat,
+            validate_int as _rs_vint,
+            validate_str as _rs_vstr,
+        )
 
     HAS_RUST = True
 except Exception:  # pure-python fallback
@@ -35,6 +61,12 @@ except Exception:  # pure-python fallback
     _RsDAG = None  # type: ignore
     _rs_loads = None  # type: ignore
     _rs_dumps = None  # type: ignore
+    _rs_vint = None  # type: ignore
+    _rs_vfloat = None  # type: ignore
+    _rs_vbool = None  # type: ignore
+    _rs_vstr = None  # type: ignore
+    _rs_parse_qs = None  # type: ignore
+    _rs_pct_decode = None  # type: ignore
 
 
 # ---------------------------------------------------------------- JSON ---
@@ -241,3 +273,81 @@ def tokio_worker_count() -> int:
     import os
 
     return os.cpu_count() or 4
+
+
+# ------------------------------------------------- Type-safe validators ---
+# Rust-first scalar coercion. Python fallbacks mirror the exact same
+# accept/reject rules so parity holds with or without the extension.
+
+def validate_int_rs(raw: str, *, ge=None, le=None, gt=None, lt=None) -> int:  # type: ignore[no-untyped-def]
+    """Strict int coercion + range checks (Rust when compiled)."""
+    if HAS_RUST:
+        return int(_rs_vint(raw, ge, le, gt, lt))  # type: ignore[misc]
+    s = raw.strip()
+    body = s.lstrip("+-")
+    if not s or not body or not body.isdigit():
+        raise ValueError("Input should be a valid integer, unable to parse string as an integer")
+    v = int(s)
+    if ge is not None and v < ge:
+        raise ValueError(f"Input should be greater than or equal to {ge}")
+    if le is not None and v > le:
+        raise ValueError(f"Input should be less than or equal to {le}")
+    if gt is not None and v <= gt:
+        raise ValueError(f"Input should be greater than {gt}")
+    if lt is not None and v >= lt:
+        raise ValueError(f"Input should be less than {lt}")
+    return v
+
+
+def validate_float_rs(raw: str, *, ge=None, le=None, gt=None, lt=None) -> float:  # type: ignore[no-untyped-def]
+    if HAS_RUST:
+        return float(_rs_vfloat(raw, ge, le, gt, lt))  # type: ignore[misc]
+    try:
+        v = float(raw.strip())
+    except Exception:
+        raise ValueError("Input should be a valid number, unable to parse string as a number")
+    if v != v or v in (float("inf"), float("-inf")):
+        raise ValueError("Input should be a finite number")
+    if ge is not None and v < ge:
+        raise ValueError(f"Input should be greater than or equal to {ge}")
+    if le is not None and v > le:
+        raise ValueError(f"Input should be less than or equal to {le}")
+    if gt is not None and v <= gt:
+        raise ValueError(f"Input should be greater than {gt}")
+    if lt is not None and v >= lt:
+        raise ValueError(f"Input should be less than {lt}")
+    return v
+
+
+def validate_bool_rs(raw: str) -> bool:
+    if HAS_RUST:
+        return bool(_rs_vbool(raw))  # type: ignore[misc]
+    low = raw.strip().lower()
+    if low in ("true", "1", "yes", "on"):
+        return True
+    if low in ("false", "0", "no", "off"):
+        return False
+    raise ValueError("Input should be a valid boolean")
+
+
+def validate_str_rs(raw: str, *, min_length=None, max_length=None, pattern=None) -> str:  # type: ignore[no-untyped-def]
+    if HAS_RUST:
+        return str(_rs_vstr(raw, min_length, max_length, pattern))  # type: ignore[misc]
+    import re as _re
+
+    n = len(raw)
+    if min_length is not None and n < min_length:
+        raise ValueError(f"String should have at least {min_length} characters")
+    if max_length is not None and n > max_length:
+        raise ValueError(f"String should have at most {max_length} characters")
+    if pattern is not None and not _re.search(pattern, raw):
+        raise ValueError(f"String should match pattern {pattern!r}")
+    return raw
+
+
+def parse_query_pairs_rs(qs: str) -> list[tuple[str, str]]:
+    if HAS_RUST:
+        return list(_rs_parse_qs(qs))  # type: ignore[misc]
+    from urllib.parse import parse_qsl
+
+    return parse_qsl(qs.lstrip("?"), keep_blank_values=True)

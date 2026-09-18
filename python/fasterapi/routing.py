@@ -35,6 +35,44 @@ def _is_pydantic_model(tp: Any) -> bool:
         return False
 
 
+_HINTS_CACHE: dict[int, dict[str, Any]] = {}
+
+
+def _resolved_hints(fn: Callable[..., Any]) -> dict[str, Any]:
+    """Resolved type hints (handles `from __future__ import annotations`).
+
+    Falls back to raw signature annotations when hints cannot be evaluated
+    (e.g. locally-defined models inside test functions).
+    """
+    key = id(fn)
+    if key in _HINTS_CACHE:
+        return _HINTS_CACHE[key]
+    try:
+        import typing
+
+        hints = typing.get_type_hints(fn, include_extras=True)
+        _HINTS_CACHE[key] = hints
+        return hints
+    except Exception:
+        return {}
+
+
+def _ann_of(fn: Callable[..., Any], pname: str, raw_ann: Any) -> Any:
+    if raw_ann is not inspect.Parameter.empty and not isinstance(raw_ann, str):
+        return raw_ann
+    hints = _resolved_hints(fn)
+    if pname in hints:
+        return hints[pname]
+    if isinstance(raw_ann, str):
+        # Last resort: evaluate in the endpoint's module globals (covers
+        # `Optional[X]`, `X | None`, `list[X]` written as strings).
+        try:
+            return eval(raw_ann, getattr(fn, "__globals__", {}), {})  # noqa: S307
+        except Exception:
+            pass
+    return raw_ann
+
+
 def _is_request_annotation(ann: Any) -> bool:
     name = getattr(ann, "__name__", str(ann))
     mod = getattr(ann, "__module__", "")
@@ -91,12 +129,80 @@ def _adapter(tp: Any) -> TypeAdapter:
     return _ADAPTER_CACHE[tp]
 
 
+def _rust_error_type(msg: str, ann: Any) -> str:
+    m = msg.lower()
+    if "valid integer" in m:
+        return "int_parsing"
+    if "valid number" in m or "finite number" in m:
+        return "float_parsing"
+    if "valid boolean" in m:
+        return "bool_parsing"
+    if "at least" in m:
+        return "string_too_short" if ann is str else "greater_than_equal"
+    if "at most" in m:
+        return "string_too_long" if ann is str else "less_than_equal"
+    if "greater than or equal" in m:
+        return "greater_than_equal"
+    if "less than or equal" in m:
+        return "less_than_equal"
+    if "greater than" in m:
+        return "greater_than"
+    if "less than" in m:
+        return "less_than"
+    if "match pattern" in m:
+        return "string_pattern_mismatch"
+    return "value_error"
+
+
 def _validate_value(loc: list[str], raw: Any, annotation: Any, meta: Optional[Param]) -> tuple[Any, Optional[dict[str, Any]]]:
-    """Validate one scalar. Returns (value, error|None)."""
+    """Validate one scalar. Returns (value, error|None).
+
+    Rust-first: `str/int/float/bool` scalars from query/path/header take the
+    zero-GIL Rust validator (strict + type-safe); everything else falls back
+    to Pydantic so behavior stays 1:1 with FastAPI.
+    """
     ann = annotation if annotation is not inspect.Parameter.empty else Any
     if ann is Any:
         err = _check_constraints("", loc, raw, meta)
         return raw, err
+    # --- Rust fast-path for scalars arriving as strings (query/path/header) ---
+    if isinstance(raw, str) and ann in (int, float, bool, str) and _bridge.HAS_RUST:
+        try:
+            if ann is int:
+                v = _bridge.validate_int_rs(
+                    raw,
+                    ge=int(meta.ge) if meta and meta.ge is not None else None,
+                    le=int(meta.le) if meta and meta.le is not None else None,
+                    gt=int(meta.gt) if meta and meta.gt is not None else None,
+                    lt=int(meta.lt) if meta and meta.lt is not None else None,
+                )
+                return v, None
+            if ann is float:
+                v = _bridge.validate_float_rs(
+                    raw,
+                    ge=float(meta.ge) if meta and meta.ge is not None else None,
+                    le=float(meta.le) if meta and meta.le is not None else None,
+                    gt=float(meta.gt) if meta and meta.gt is not None else None,
+                    lt=float(meta.lt) if meta and meta.lt is not None else None,
+                )
+                return v, None
+            if ann is bool:
+                return _bridge.validate_bool_rs(raw), None
+            if ann is str:
+                v = _bridge.validate_str_rs(
+                    raw,
+                    min_length=meta.min_length if meta else None,
+                    max_length=meta.max_length if meta else None,
+                    pattern=meta.pattern if meta else None,
+                )
+                return v, None
+        except Exception as exc:
+            msg = str(exc)
+            # Strip Rust `ValueError: ` prefix if present.
+            if ": " in msg and msg.split(": ", 1)[0].endswith("Error"):
+                msg = msg.split(": ", 1)[1]
+            return None, {"loc": loc, "msg": msg,
+                          "type": _rust_error_type(msg, ann), "input": raw}
     # bool query strings need normalization before pydantic
     if ann is bool and isinstance(raw, str):
         parsed = _parse_bool(raw)
@@ -183,7 +289,7 @@ async def _solve_fn_kwargs(
     kwargs: dict[str, Any] = {}
     errors: list[dict[str, Any]] = []
     for pname, param in sig.parameters.items():
-        ann = param.annotation
+        ann = _ann_of(fn, pname, param.annotation)
         default = param.default
 
         # --- Request injection ------------------------------------------------
@@ -742,6 +848,7 @@ def _make_ws_handler(fn: Callable[..., Any]) -> Callable[[WebSocket], Coroutine[
             async with AsyncExitStack() as stack:
                 cache: dict[int, Any] = {}
                 for pname, param in sig.parameters.items():
+                    ann = _ann_of(fn, pname, param.annotation)
                     if isinstance(param.default, Depends) and param.default.dependency is not None:
                         dep = param.default.dependency
                         sub = await _solve_fn_kwargs(
@@ -751,8 +858,14 @@ def _make_ws_handler(fn: Callable[..., Any]) -> Callable[[WebSocket], Coroutine[
                             cache=cache, stack=stack,
                         )
                         kwargs[pname] = await _call_with_teardown(dep, sub, stack)
-                    elif param.annotation is WebSocket or pname in ("websocket", "ws"):
+                    elif ann is WebSocket or pname in ("websocket", "ws", "connection"):
                         kwargs[pname] = ws
+                    elif pname == "self":
+                        continue
+                    elif param.default is inspect.Parameter.empty:
+                        # Unannotated single-arg websocket endpoint: assume the socket.
+                        if len(sig.parameters) == 1:
+                            kwargs[pname] = ws
                 if inspect.iscoroutinefunction(fn):
                     await fn(**kwargs)
                 else:

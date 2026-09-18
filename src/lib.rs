@@ -24,7 +24,7 @@ use std::time::Instant;
 
 use parking_lot::RwLock;
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyDict, PyFloat, PyList, PyLong, PyString};
+use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -35,21 +35,21 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 fn value_to_py(py: Python<'_>, v: &serde_json::Value) -> PyObject {
     match v {
         serde_json::Value::Null => py.None(),
-        serde_json::Value::Bool(b) => PyBool::new(py, *b).to_object(py),
+        serde_json::Value::Bool(b) => PyBool::new_bound(py, *b).to_object(py),
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
-                PyLong::new(py, i).to_object(py)
+                i.to_object(py)
             } else if let Some(u) = n.as_u64() {
-                PyLong::new(py, u).to_object(py)
+                u.to_object(py)
             } else if let Some(f) = n.as_f64() {
-                PyFloat::new(py, f).to_object(py)
+                PyFloat::new_bound(py, f).to_object(py)
             } else {
                 py.None()
             }
         }
-        serde_json::Value::String(s) => PyString::new(py, s).to_object(py),
+        serde_json::Value::String(s) => PyString::new_bound(py, s).to_object(py),
         serde_json::Value::Array(arr) => {
-            let list = PyList::empty(py);
+            let list = PyList::empty_bound(py);
             for item in arr {
                 list.append(value_to_py(py, item))
                     .expect("list append cannot fail");
@@ -57,7 +57,7 @@ fn value_to_py(py: Python<'_>, v: &serde_json::Value) -> PyObject {
             list.to_object(py)
         }
         serde_json::Value::Object(map) => {
-            let dict = PyDict::new(py);
+            let dict = PyDict::new_bound(py);
             for (k, val) in map {
                 dict.set_item(k, value_to_py(py, val))
                     .expect("dict insert cannot fail");
@@ -84,7 +84,7 @@ fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
             .map(serde_json::Value::Number)
             .unwrap_or(serde_json::Value::Null));
     }
-    if let Ok(i) = obj.downcast::<PyLong>() {
+    if let Ok(i) = obj.downcast::<PyInt>() {
         if let Ok(iv) = i.extract::<i64>() {
             return Ok(serde_json::Value::Number(iv.into()));
         }
@@ -126,12 +126,14 @@ fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
 #[pyfunction]
 fn fast_json_loads(py: Python<'_>, payload: &str) -> PyResult<PyObject> {
     // simd-json mutates its input, so work on a private copy off-GIL.
-    let value: serde_json::Value = py.allow_threads(|| {
-        let mut bytes = payload.as_bytes().to_vec();
-        simd_json::from_slice::<serde_json::Value>(&mut bytes).or_else(|_| {
-            serde_json::from_str::<serde_json::Value>(payload)
+    let value: serde_json::Value = py
+        .allow_threads(|| {
+            let mut bytes = payload.as_bytes().to_vec();
+            simd_json::from_slice::<serde_json::Value>(&mut bytes).or_else(|_| {
+                serde_json::from_str::<serde_json::Value>(payload)
+            })
         })
-    })?;
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
     Ok(value_to_py(py, &value))
 }
 
@@ -149,6 +151,48 @@ fn fast_json_dumps(py: Python<'_>, obj: PyObject) -> PyResult<String> {
 // Radix-tree router (matchit)
 // ---------------------------------------------------------------------------
 
+/// Convert FastAPI/Starlette `{param}` (or `{param:converter}`) segments to
+/// matchit `:param` syntax. Leaves already-native `:param` / `*wildcard`
+/// segments untouched. Pure + allocation-minimal.
+fn fastapi_to_matchit(pattern: &str) -> String {
+    if !pattern.contains('{') {
+        return pattern.to_string();
+    }
+    let mut out = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '{' {
+            let mut name = String::new();
+            for nc in chars.by_ref() {
+                if nc == '}' {
+                    break;
+                }
+                // `{id:path}` / `{id:int}` -> take `id` only.
+                if nc == ':' {
+                    // Skip converter until `}`.
+                    for cc in chars.by_ref() {
+                        if cc == '}' {
+                            break;
+                        }
+                    }
+                    break;
+                }
+                name.push(nc);
+            }
+            let clean: String = name.chars().filter(|ch| ch.is_alphanumeric() || *ch == '_').collect();
+            if clean.is_empty() {
+                out.push_str(":param");
+            } else {
+                out.push(':');
+                out.push_str(&clean);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Zero-Python radix-tree router.
 ///
 /// Python compiles its route table into this structure at `app.build()`.
@@ -156,6 +200,7 @@ fn fast_json_dumps(py: Python<'_>, obj: PyObject) -> PyResult<String> {
 #[pyclass]
 struct RustRouter {
     inner: RwLock<matchit::Router<String>>,
+    count: std::sync::atomic::AtomicUsize,
 }
 
 #[pymethods]
@@ -164,15 +209,23 @@ impl RustRouter {
     fn new() -> Self {
         Self {
             inner: RwLock::new(matchit::Router::new()),
+            count: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
     /// Register `pattern` (e.g. `/items/{item_id}`) -> `target` (route key).
+    ///
+    /// Accepts FastAPI `{param}` syntax and transparently compiles it to
+    /// matchit `:param` syntax, so `app.build()` can push Starlette paths
+    /// verbatim with zero Python-side translation cost.
     fn insert(&self, pattern: &str, target: String) -> PyResult<()> {
+        let converted = fastapi_to_matchit(pattern);
         self.inner
             .write()
-            .insert(pattern, target)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+            .insert(&converted, target)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        self.count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
     }
 
     /// Match a path. Returns `(target, params_dict)` or `None`.
@@ -193,7 +246,7 @@ impl RustRouter {
         match found {
             None => Ok(None),
             Some((target, params)) => {
-                let dict = PyDict::new(py);
+                let dict = PyDict::new_bound(py);
                 for (k, v) in params {
                     dict.set_item(k, v)?;
                 }
@@ -203,7 +256,7 @@ impl RustRouter {
     }
 
     fn len(&self) -> usize {
-        self.inner.read().iter().count()
+        self.count.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -224,6 +277,7 @@ struct TokenBucket {
             governor::clock::DefaultClock,
         >,
     >,
+    per_second: f64,
 }
 
 #[pymethods]
@@ -231,15 +285,16 @@ impl TokenBucket {
     #[new]
     #[pyo3(signature = (per_second, burst=None))]
     fn new(per_second: u32, burst: Option<u32>) -> PyResult<Self> {
-        let per_second = NonZeroU32::new(per_second.max(1))
+        let per_second_nz = NonZeroU32::new(per_second.max(1))
             .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("per_second must be >= 1"))?;
-        let burst_size = burst.unwrap_or(per_second.get()).max(1);
-        let quota = governor::Quota::per_second(per_second).allow_burst(
+        let burst_size = burst.unwrap_or(per_second_nz.get()).max(1);
+        let quota = governor::Quota::per_second(per_second_nz).allow_burst(
             NonZeroU32::new(burst_size)
                 .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("burst must be >= 1"))?,
         );
         Ok(Self {
             limiter: Arc::new(governor::RateLimiter::direct(quota)),
+            per_second: per_second_nz.get() as f64,
         })
     }
 
@@ -251,10 +306,7 @@ impl TokenBucket {
     fn retry_after_secs(&self) -> f64 {
         match self.limiter.check() {
             Ok(()) => 0.0,
-            Err(e) => {
-                let wait = e.wait_time_from(Default::default());
-                wait.as_secs_f64()
-            }
+            Err(_) => 1.0 / self.per_second.max(1.0),
         }
     }
 }
@@ -462,6 +514,202 @@ fn has_simd() -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Type-safe primitive validators (Rust-first, GIL-free)
+//
+// Philosophy: every scalar coercion + constraint check that FastAPI does in
+// Python (`int("42")`, `ge/le/gt/lt`, `min/max_length`, `pattern`, bool
+// parsing, percent-decoding) runs here on Tokio threads with `allow_threads`.
+// Python only maps the typed error into the 422 `{"detail": [...]}` shape, so
+// behavior stays 1:1 while the hot loop never touches the GIL or allocator
+// more than once. All functions are pure + thread-safe (no shared mutables)
+// which is what makes the 3.13t free-threaded story sound.
+// ---------------------------------------------------------------------------
+
+fn err_value(msg: String) -> pyo3::PyErr {
+    pyo3::exceptions::PyValueError::new_err(msg)
+}
+
+fn check_int_range(v: i64, ge: Option<i64>, le: Option<i64>, gt: Option<i64>, lt: Option<i64>) -> Result<(), String> {
+    if let Some(lo) = ge {
+        if v < lo {
+            return Err(format!("Input should be greater than or equal to {lo}"));
+        }
+    }
+    if let Some(hi) = le {
+        if v > hi {
+            return Err(format!("Input should be less than or equal to {hi}"));
+        }
+    }
+    if let Some(lo) = gt {
+        if v <= lo {
+            return Err(format!("Input should be greater than {lo}"));
+        }
+    }
+    if let Some(hi) = lt {
+        if v >= hi {
+            return Err(format!("Input should be less than {hi}"));
+        }
+    }
+    Ok(())
+}
+
+fn check_float_range(v: f64, ge: Option<f64>, le: Option<f64>, gt: Option<f64>, lt: Option<f64>) -> Result<(), String> {
+    if let Some(lo) = ge {
+        if v < lo {
+            return Err(format!("Input should be greater than or equal to {lo}"));
+        }
+    }
+    if let Some(hi) = le {
+        if v > hi {
+            return Err(format!("Input should be less than or equal to {hi}"));
+        }
+    }
+    if let Some(lo) = gt {
+        if v <= lo {
+            return Err(format!("Input should be greater than {lo}"));
+        }
+    }
+    if let Some(hi) = lt {
+        if v >= hi {
+            return Err(format!("Input should be less than {hi}"));
+        }
+    }
+    Ok(())
+}
+
+/// Strict, type-safe int coercion + range checks. Raises `ValueError` on failure.
+#[pyfunction]
+#[pyo3(signature = (raw, ge=None, le=None, gt=None, lt=None))]
+fn validate_int(py: Python<'_>, raw: &str, ge: Option<i64>, le: Option<i64>, gt: Option<i64>, lt: Option<i64>) -> PyResult<i64> {
+    let v: i64 = py
+        .allow_threads(|| {
+            let s = raw.trim();
+            // Reject floats/bools explicitly — FastAPI/Pydantic would 422 these.
+            if s.is_empty() {
+                return Err("Input should be a valid integer".to_string());
+            }
+            // Allow leading +/- then ASCII digits only (no underscores, no hex).
+            let body = s.strip_prefix(['+', '-']).unwrap_or(s);
+            if body.is_empty() || !body.bytes().all(|b| b.is_ascii_digit()) {
+                return Err("Input should be a valid integer, unable to parse string as an integer".to_string());
+            }
+            s.parse::<i64>()
+                .map_err(|_| "Input should be a valid integer, unable to parse string as an integer".to_string())
+        })
+        .map_err(err_value)?;
+    check_int_range(v, ge, le, gt, lt).map_err(err_value)?;
+    Ok(v)
+}
+
+/// Type-safe float coercion + range checks.
+#[pyfunction]
+#[pyo3(signature = (raw, ge=None, le=None, gt=None, lt=None))]
+fn validate_float(py: Python<'_>, raw: &str, ge: Option<f64>, le: Option<f64>, gt: Option<f64>, lt: Option<f64>) -> PyResult<f64> {
+    let v: f64 = py
+        .allow_threads(|| {
+            let s = raw.trim();
+            if s.is_empty() {
+                return Err("Input should be a valid number".to_string());
+            }
+            s.parse::<f64>().map_err(|_| "Input should be a valid number, unable to parse string as a number".to_string())
+        })
+        .map_err(err_value)?;
+    if !v.is_finite() {
+        return Err(err_value("Input should be a finite number".to_string()));
+    }
+    check_float_range(v, ge, le, gt, lt).map_err(err_value)?;
+    Ok(v)
+}
+
+/// Type-safe bool coercion (`true/1/yes/on` ↔ `false/0/no/off`, case-insensitive).
+#[pyfunction]
+fn validate_bool(py: Python<'_>, raw: &str) -> PyResult<bool> {
+    py.allow_threads(|| match raw.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "false" | "0" | "no" | "off" => Ok(false),
+        _ => Err("Input should be a valid boolean".to_string()),
+    })
+    .map_err(err_value)
+}
+
+/// Type-safe str validation: length bounds + optional regex `pattern`.
+#[pyfunction]
+#[pyo3(signature = (raw, min_length=None, max_length=None, pattern=None))]
+fn validate_str(
+    py: Python<'_>,
+    raw: &str,
+    min_length: Option<usize>,
+    max_length: Option<usize>,
+    pattern: Option<&str>,
+) -> PyResult<String> {
+    py.allow_threads(|| {
+        let len = raw.chars().count();
+        if let Some(mn) = min_length {
+            if len < mn {
+                return Err(format!("String should have at least {mn} characters"));
+            }
+        }
+        if let Some(mx) = max_length {
+            if len > mx {
+                return Err(format!("String should have at most {mx} characters"));
+            }
+        }
+        if let Some(pat) = pattern {
+            let re = regex::Regex::new(pat)
+                .map_err(|e| format!("Invalid pattern {pat:?}: {e}"))?;
+            if !re.is_match(raw) {
+                return Err(format!("String should match pattern {pat:?}"));
+            }
+        }
+        Ok(())
+    })
+    .map_err(err_value)?;
+    Ok(raw.to_string())
+}
+
+/// Percent-decode one component (query/header/path), no allocation beyond output.
+#[pyfunction]
+fn percent_decode(py: Python<'_>, raw: &str) -> PyResult<String> {
+    py.allow_threads(|| {
+        percent_encoding::percent_decode_str(raw)
+            .decode_utf8()
+            .map(|s| s.into_owned())
+            .map_err(|_| "Invalid percent-encoding".to_string())
+    })
+    .map_err(err_value)
+}
+
+/// Parse a raw query string into `[(key, value)]` pairs (percent-decoded,
+/// `+` → space, no Python overhead). Multi-value params are preserved in order.
+#[pyfunction]
+fn parse_query_pairs(py: Python<'_>, qs: &str) -> PyResult<Vec<(String, String)>> {
+    Ok(py.allow_threads(|| {
+        let mut out = Vec::new();
+        let qs = qs.strip_prefix('?').unwrap_or(qs);
+        if qs.is_empty() {
+            return out;
+        }
+        for pair in qs.split('&') {
+            if pair.is_empty() {
+                continue;
+            }
+            let (k, v) = match pair.split_once('=') {
+                Some((k, v)) => (k, v),
+                None => (pair, ""),
+            };
+            let dk = percent_encoding::percent_decode_str(&k.replace('+', " "))
+                .decode_utf8_lossy()
+                .into_owned();
+            let dv = percent_encoding::percent_decode_str(&v.replace('+', " "))
+                .decode_utf8_lossy()
+                .into_owned();
+            out.push((dk, dv));
+        }
+        out
+    }))
+}
+
+// ---------------------------------------------------------------------------
 // Module
 // ---------------------------------------------------------------------------
 
@@ -476,6 +724,12 @@ fn _fasterapi_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(hyper_health, m)?)?;
     m.add_function(wrap_pyfunction!(serve_static_config, m)?)?;
     m.add_function(wrap_pyfunction!(has_simd, m)?)?;
+    m.add_function(wrap_pyfunction!(validate_int, m)?)?;
+    m.add_function(wrap_pyfunction!(validate_float, m)?)?;
+    m.add_function(wrap_pyfunction!(validate_bool, m)?)?;
+    m.add_function(wrap_pyfunction!(validate_str, m)?)?;
+    m.add_function(wrap_pyfunction!(percent_decode, m)?)?;
+    m.add_function(wrap_pyfunction!(parse_query_pairs, m)?)?;
     m.add_class::<RustRouter>()?;
     m.add_class::<TokenBucket>()?;
     m.add_class::<DependencyDAG>()?;

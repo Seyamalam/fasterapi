@@ -59,7 +59,7 @@ Issues = "https://github.com/Seyamalam/fasterapi/issues"
 [tool.maturin]
 bindings = "pyo3"
 features = ["pyo3/extension-module"]
-module-name = "_fasterapi_rs"
+module-name = "fasterapi._fasterapi_rs"
 python-source = "python"
 # Pure-Python fallback works without compiling; Rust ext accelerates routing/JSON/rate-limit.
 
