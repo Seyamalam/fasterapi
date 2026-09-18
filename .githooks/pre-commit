@@ -26,5 +26,10 @@ if ! PYTHONPATH="$ROOT/python" "$PY" -c "import fastapi, starlette" 2>/dev/null;
   echo "=== pre-commit OK (advisory) ==="
   exit 0
 fi
+# Refresh the auto-generated README tables so every commit carries fresh
+# parity/bench numbers; stage the result into this commit. Fails the commit
+# when parity is red (parity is king).
+PYTHONPATH="$ROOT/python" "$PY" scripts/update_readme_tables.py
+git add README.md
 PYTHONPATH="$ROOT/python" "$PY" -m pytest tests/test_fasterapi_native.py -q
 echo "=== pre-commit OK ==="
