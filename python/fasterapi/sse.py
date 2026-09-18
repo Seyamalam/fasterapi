@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Annotated, Any, Optional
 
 from pydantic import AfterValidator, BaseModel, Field
+from pydantic import model_validator as model_validator  # noqa: F401 (surface parity)
 from starlette.responses import StreamingResponse
 
 

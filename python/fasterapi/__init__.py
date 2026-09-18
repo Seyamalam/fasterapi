@@ -19,6 +19,18 @@ the single-pass ``validate_json`` path and responses the ``dump_json`` path.
 from __future__ import annotations
 
 from . import _rust_bridge as _rust_bridge  # noqa: F401
+from . import concurrency as concurrency  # noqa: F401 (submodule surface parity)
+from . import dependencies as dependencies  # noqa: F401
+from . import exception_handlers as exception_handlers  # noqa: F401
+from . import logger as logger  # noqa: F401
+from . import middleware as middleware  # noqa: F401
+from . import openapi as openapi  # noqa: F401
+from . import param_functions as param_functions  # noqa: F401
+from . import requests as requests  # noqa: F401
+from . import status as status  # noqa: F401
+from . import types as types  # noqa: F401
+from . import utils as utils  # noqa: F401
+from . import websockets as websockets  # noqa: F401
 from ._version import __version__
 from .applications import FastAPI
 from .background import BackgroundTask, BackgroundTasks

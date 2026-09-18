@@ -17,6 +17,8 @@ from starlette.responses import (  # noqa: F401
 
 from .sse import EventSourceResponse as EventSourceResponse  # noqa: F401
 
+from .exceptions import FastAPIDeprecationWarning as FastAPIDeprecationWarning  # noqa: F401
+
 try:
     _ujson = importlib.import_module("ujson")
 except ModuleNotFoundError:  # pragma: no cover

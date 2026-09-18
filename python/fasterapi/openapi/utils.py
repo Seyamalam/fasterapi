@@ -13,6 +13,21 @@ import inspect
 from typing import Any, Optional
 
 from pydantic import BaseModel, TypeAdapter
+from starlette.responses import JSONResponse as JSONResponse  # noqa: F401 (surface parity)
+from starlette.responses import Response as Response  # noqa: F401 (surface parity)
+
+from ..encoders import jsonable_encoder as jsonable_encoder  # noqa: F401
+from ..params import Body as Body  # noqa: F401 (surface parity)
+from ..params import ParamTypes as ParamTypes  # noqa: F401 (surface parity)
+from ..utils import generate_operation_id_for_path as generate_operation_id_for_path  # noqa: F401
+from ..utils import is_body_allowed_for_status_code as is_body_allowed_for_status_code  # noqa: F401
+
+
+def lenient_issubclass(cls: Any, class_or_tuple: Any) -> bool:
+    try:
+        return isinstance(cls, type) and issubclass(cls, class_or_tuple)
+    except TypeError:
+        return False
 
 
 def _is_model(tp: Any) -> bool:
@@ -176,126 +191,23 @@ def get_openapi(
     servers: Optional[list[dict[str, Any]]] = None,
     **_extra: Any,
 ) -> dict[str, Any]:
-    from ..params import Depends, Param
-    from ..routing import _ann_of, _is_pydantic_model, _signature
-
     paths: dict[str, Any] = {}
     components: dict[str, Any] = {}
     security_schemes: dict[str, Any] = {}
+    operation_ids: set[str] = set()
     for route in routes:
-        endpoint = getattr(route, "endpoint", None)
-        if endpoint is None:
+        if getattr(route, "endpoint", None) is None:
             continue
-        methods = [m.lower() for m in (getattr(route, "methods", None) or ["get"])]
         rpath = openapi_prefix + getattr(route, "path", "/")
         item = paths.setdefault(rpath, {})
-        try:
-            sig = inspect.signature(endpoint)
-        except (TypeError, ValueError):
-            continue
-        parameters: list[dict[str, Any]] = []
-        body_model: Any = None
-        body_required = False
-        has_validation = False
-        for pname, param in sig.parameters.items():
-            ann = _ann_of(endpoint, pname, param.annotation)
-            default = param.default
-            if isinstance(default, Depends):
-                continue
-            dname = getattr(ann, "__name__", "")
-            if dname in ("Request", "HTTPConnection", "BackgroundTasks", "SecurityScopes") \
-                    or pname in ("request", "background_tasks"):
-                continue
-            if isinstance(default, Param):
-                if default.in_ in ("query", "path", "header", "cookie"):
-                    has_validation = True
-                    alias = default.alias or pname
-                    schema = _param_schema(ann, default)
-                    schema.setdefault("title", _title(alias))
-                    entry: dict[str, Any] = {
-                        "name": alias, "in": default.in_,
-                        "required": default.default is Ellipsis,
-                        "schema": schema,
-                    }
-                    if default.description:
-                        entry["description"] = default.description
-                    # FastAPI omits null defaults from the schema.
-                    if default.has_default() and default.default is not Ellipsis \
-                            and default.default is not None:
-                        entry["schema"]["default"] = default.default
-                    parameters.append(entry)
-                elif default.in_ == "body":
-                    has_validation = True
-                    if _is_pydantic_model(ann) and not default.embed:
-                        body_model, body_required = ann, True
-                continue
-            if _is_pydantic_model(ann):
-                has_validation = True
-                body_model, body_required = ann, True
-                continue
-            if pname in rpath:
-                has_validation = True
-                schema = _param_schema(ann)
-                schema.setdefault("title", _title(pname))
-                parameters.append({"name": pname, "in": "path", "required": True, "schema": schema})
-                continue
-            if default is not inspect.Parameter.empty:
-                has_validation = True
-                schema = _param_schema(ann)
-                schema.setdefault("title", _title(pname))
-                entry = {"name": pname, "in": "query", "required": False, "schema": schema}
-                if default is not None:
-                    entry["schema"]["default"] = default
-                parameters.append(entry)
-                continue
-            # Required bare param -> required query (FastAPI behavior).
-            has_validation = True
-            schema = _param_schema(ann)
-            schema.setdefault("title", _title(pname))
-            parameters.append({"name": pname, "in": "query", "required": True, "schema": schema})
-
-        op: dict[str, Any] = {
-            "summary": getattr(route, "summary", None) or getattr(endpoint, "__name__", rpath).replace("_", " ").title(),
-            "operationId": _operation_id(route, endpoint, methods[0]),
-        }
-        op_description = getattr(route, "description", None) or inspect.getdoc(endpoint)
-        if op_description:
-            op["description"] = op_description
-        if getattr(route, "deprecated", False):
-            op["deprecated"] = True
-        if getattr(route, "tags", None):
-            op["tags"] = list(route.tags)
-        if parameters:
-            op["parameters"] = parameters
-        if body_model is not None:
-            ref = _register_model(body_model, components)
-            op["requestBody"] = {
-                "content": {"application/json": {"schema": {"$ref": ref}}},
-                "required": body_required,
-            }
-        resp_model = getattr(route, "response_model", None)
-        status = str(getattr(route, "status_code", 200))
-        ok: dict[str, Any] = {"description": "Successful Response"}
-        if _is_model(resp_model):
-            ok["content"] = {"application/json": {"schema": {"$ref": _register_model(resp_model, components)}}}
-        else:
-            ok["content"] = {"application/json": {"schema": {}}}
-        responses: dict[str, Any] = {status: ok}
-        if has_validation:
-            components.setdefault("ValidationError", dict(_VALIDATION_ERROR_SCHEMA))
-            components.setdefault("HTTPValidationError", dict(_HTTP_VALIDATION_ERROR_SCHEMA))
-            responses["422"] = {
-                "description": "Validation Error",
-                "content": {"application/json": {"schema": {"$ref": "#/components/schemas/HTTPValidationError"}}},
-            }
-        op["responses"] = responses
-        # Security: schemes referenced by Depends()/Security() on the endpoint
-        # or the route produce components + per-operation requirements.
-        op_security = _route_security(route, endpoint, security_schemes)
-        if op_security:
-            op["security"] = op_security
-        for m in methods:
-            item[m] = op
+        path_item, schemas, schemes = get_openapi_path(
+            route=route, operation_ids=operation_ids, openapi_prefix=openapi_prefix
+        )
+        item.update(path_item)
+        for key, value in schemas.items():
+            components.setdefault(key, value)
+        for key, value in schemes.items():
+            security_schemes.setdefault(key, value)
     doc: dict[str, Any] = {
         "openapi": openapi_version,
         "info": {"title": title, "version": version},
@@ -314,6 +226,181 @@ def get_openapi(
     return doc
 
 
+def generate_operation_summary(*, route: Any, method: str) -> str:
+    if getattr(route, "summary", None):
+        return route.summary
+    endpoint = getattr(route, "endpoint", None)
+    name = getattr(route, "name", None) or getattr(endpoint, "__name__", "route")
+    return name.replace("_", " ").title()
+
+
+def generate_operation_id(*, route: Any, method: str) -> str:  # pragma: nocover
+    import warnings as _warnings
+
+    from ..exceptions import FastAPIDeprecationWarning
+
+    _warnings.warn(
+        message="fasterapi.openapi.utils.generate_operation_id() was deprecated, "
+        "it is not used internally, and will be removed soon",
+        category=FastAPIDeprecationWarning,
+        stacklevel=2,
+    )
+    if getattr(route, "operation_id", None):
+        return route.operation_id
+    return _operation_id(route, getattr(route, "endpoint", None), method)
+
+
+def get_openapi_operation_metadata(
+    *, route: Any, method: str, operation_ids: set[str]
+) -> dict[str, Any]:
+    operation: dict[str, Any] = {}
+    if getattr(route, "tags", None):
+        operation["tags"] = list(route.tags)
+    operation["summary"] = generate_operation_summary(route=route, method=method)
+    endpoint = getattr(route, "endpoint", None)
+    description = getattr(route, "description", None) or (inspect.getdoc(endpoint) if endpoint else None)
+    if description:
+        operation["description"] = description
+    operation_id = getattr(route, "operation_id", None) or _operation_id(
+        route, endpoint, method
+    )
+    if operation_id in operation_ids:
+        endpoint_name = getattr(endpoint, "__name__", "<unnamed_endpoint>")
+        message = f"Duplicate Operation ID {operation_id} for function {endpoint_name}"
+        file_name = getattr(endpoint, "__globals__", {}).get("__file__") if endpoint else None
+        if file_name:
+            message += f" at {file_name}"
+        import warnings as _warnings
+
+        _warnings.warn(message, stacklevel=1)
+    operation_ids.add(operation_id)
+    operation["operationId"] = operation_id
+    if getattr(route, "deprecated", False):
+        operation["deprecated"] = True
+    return operation
+
+
+def get_openapi_path(
+    *,
+    route: Any,
+    operation_ids: set[str],
+    openapi_prefix: str = "",
+    **_extra: Any,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Build one path item plus its new component/security schemas.
+
+    Extra kwargs (e.g. upstream's ``model_name_map``) are accepted and
+    ignored so custom-``openapi()`` code keeps calling through.
+    """
+    from ..params import Depends, Param
+    from ..routing import _ann_of, _is_pydantic_model, _signature
+
+    endpoint = getattr(route, "endpoint", None)
+    methods = [m.lower() for m in (getattr(route, "methods", None) or ["get"])]
+    rpath = openapi_prefix + getattr(route, "path", "/")
+    components: dict[str, Any] = {}
+    security_schemes: dict[str, Any] = {}
+    item: dict[str, Any] = {}
+    try:
+        sig = inspect.signature(endpoint)
+    except (TypeError, ValueError):
+        return item, components, security_schemes
+    parameters: list[dict[str, Any]] = []
+    body_model: Any = None
+    body_required = False
+    has_validation = False
+    for pname, param in sig.parameters.items():
+        ann = _ann_of(endpoint, pname, param.annotation)
+        default = param.default
+        if isinstance(default, Depends):
+            continue
+        dname = getattr(ann, "__name__", "")
+        if dname in ("Request", "HTTPConnection", "BackgroundTasks", "SecurityScopes") \
+                or pname in ("request", "background_tasks"):
+            continue
+        if isinstance(default, Param):
+            if default.in_ in ("query", "path", "header", "cookie"):
+                has_validation = True
+                alias = default.alias or pname
+                schema = _param_schema(ann, default)
+                schema.setdefault("title", _title(alias))
+                entry: dict[str, Any] = {
+                    "name": alias, "in": default.in_,
+                    "required": default.default is Ellipsis,
+                    "schema": schema,
+                }
+                if default.description:
+                    entry["description"] = default.description
+                # FastAPI omits null defaults from the schema.
+                if default.has_default() and default.default is not Ellipsis \
+                        and default.default is not None:
+                    entry["schema"]["default"] = default.default
+                parameters.append(entry)
+            elif default.in_ == "body":
+                has_validation = True
+                if _is_pydantic_model(ann) and not default.embed:
+                    body_model, body_required = ann, True
+            continue
+        if _is_pydantic_model(ann):
+            has_validation = True
+            body_model, body_required = ann, True
+            continue
+        if pname in rpath:
+            has_validation = True
+            schema = _param_schema(ann)
+            schema.setdefault("title", _title(pname))
+            parameters.append({"name": pname, "in": "path", "required": True, "schema": schema})
+            continue
+        if default is not inspect.Parameter.empty:
+            has_validation = True
+            schema = _param_schema(ann)
+            schema.setdefault("title", _title(pname))
+            entry = {"name": pname, "in": "query", "required": False, "schema": schema}
+            if default is not None:
+                entry["schema"]["default"] = default
+            parameters.append(entry)
+            continue
+        # Required bare param -> required query (FastAPI behavior).
+        has_validation = True
+        schema = _param_schema(ann)
+        schema.setdefault("title", _title(pname))
+        parameters.append({"name": pname, "in": "query", "required": True, "schema": schema})
+
+    op = get_openapi_operation_metadata(route=route, method=methods[0], operation_ids=operation_ids)
+    if parameters:
+        op["parameters"] = parameters
+    if body_model is not None:
+        ref = _register_model(body_model, components)
+        op["requestBody"] = {
+            "content": {"application/json": {"schema": {"$ref": ref}}},
+            "required": body_required,
+        }
+    resp_model = getattr(route, "response_model", None)
+    status = str(getattr(route, "status_code", 200))
+    ok: dict[str, Any] = {"description": "Successful Response"}
+    if _is_model(resp_model):
+        ok["content"] = {"application/json": {"schema": {"$ref": _register_model(resp_model, components)}}}
+    else:
+        ok["content"] = {"application/json": {"schema": {}}}
+    responses: dict[str, Any] = {status: ok}
+    if has_validation:
+        components.setdefault("ValidationError", dict(_VALIDATION_ERROR_SCHEMA))
+        components.setdefault("HTTPValidationError", dict(_HTTP_VALIDATION_ERROR_SCHEMA))
+        responses["422"] = {
+            "description": "Validation Error",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/HTTPValidationError"}}},
+        }
+    op["responses"] = responses
+    # Security: schemes referenced by Depends()/Security() on the endpoint
+    # or the route produce components + per-operation requirements.
+    op_security = _route_security(route, endpoint, security_schemes)
+    if op_security:
+        op["security"] = op_security
+    for m in methods:
+        item[m] = op
+    return item, components, security_schemes
+
+
 def _operation_id(route: Any, endpoint: Any, method: str) -> str:
     import re as _re
 
@@ -322,9 +409,3 @@ def _operation_id(route: Any, endpoint: Any, method: str) -> str:
     op_id = f"{name}{path}"
     op_id = _re.sub(r"\W", "_", op_id)
     return f"{op_id}_{method.lower()}"
-
-
-def get_openapi_path(  # pragma: no cover - convenience alias
-    **kwargs: Any,
-) -> dict[str, Any]:
-    return get_openapi(**kwargs)

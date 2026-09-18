@@ -12,15 +12,33 @@ import inspect
 from typing import Any, Callable, Optional
 
 from starlette.applications import Starlette
+from starlette.datastructures import State as State  # noqa: F401
+from starlette.middleware import Middleware as Middleware  # noqa: F401
+from starlette.middleware.base import BaseHTTPMiddleware as BaseHTTPMiddleware  # noqa: F401
+from starlette.middleware.exceptions import ExceptionMiddleware as ExceptionMiddleware  # noqa: F401
+from starlette.middleware.errors import ServerErrorMiddleware as ServerErrorMiddleware  # noqa: F401
 from starlette.requests import Request
+from starlette.responses import HTMLResponse as HTMLResponse  # noqa: F401
+from starlette.routing import BaseRoute as BaseRoute  # noqa: F401
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route as StarletteRoute
 
 from . import _rust_bridge as _bridge
 from .dag import CompiledDAG, compile_app_dag
+from .exception_handlers import http_exception_handler as http_exception_handler  # noqa: F401
+from .exception_handlers import request_validation_exception_handler as request_validation_exception_handler  # noqa: F401
+from .exception_handlers import websocket_request_validation_exception_handler as websocket_request_validation_exception_handler  # noqa: F401
 from .exceptions import HTTPException, RequestValidationError
+from .exceptions import WebSocketRequestValidationError as WebSocketRequestValidationError  # noqa: F401
+from .middleware.asyncexitstack import AsyncExitStackMiddleware as AsyncExitStackMiddleware  # noqa: F401
+from .openapi.docs import get_redoc_html as get_redoc_html  # noqa: F401
+from .openapi.docs import get_swagger_ui_html as get_swagger_ui_html  # noqa: F401
+from .openapi.docs import get_swagger_ui_oauth2_redirect_html as get_swagger_ui_oauth2_redirect_html  # noqa: F401
+from .openapi.utils import get_openapi as get_openapi  # noqa: F401
 from .params import Depends
 from .routing import APIRouter
+from .types import DecoratedCallable as DecoratedCallable  # noqa: F401 (surface parity)
+from .utils import generate_unique_id as generate_unique_id  # noqa: F401
 
 
 class FastAPI(Starlette):

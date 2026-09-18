@@ -11,6 +11,9 @@ import re
 import warnings
 from typing import Any
 
+from .exceptions import FastAPIDeprecationWarning as FastAPIDeprecationWarning  # noqa: F401
+from pydantic.fields import FieldInfo as FieldInfo  # noqa: F401
+
 
 def is_body_allowed_for_status_code(status_code: int | str | None) -> bool:
     if status_code is None:

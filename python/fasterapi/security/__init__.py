@@ -18,8 +18,8 @@ from typing import Any, Optional
 from pydantic import BaseModel
 from starlette.requests import Request
 
-from .exceptions import HTTPException
-from .params import Form
+from ..exceptions import HTTPException
+from ..params import Form
 
 
 def get_authorization_scheme_param(authorization_header_value: Optional[str]) -> tuple[str, str]:
@@ -363,3 +363,13 @@ class APIKeyCookie(APIKeyBase):
 
     async def __call__(self, request: Request) -> Optional[str]:
         return self.check_api_key(request.cookies.get(self.name))
+
+
+# Submodule attributes (mirror `fastapi.security.*` import paths). Kept at
+# the end: submodules import back from this fully-initialized package.
+from . import api_key as api_key  # noqa: F401,E402
+from . import base as base  # noqa: F401,E402
+from . import http as http  # noqa: F401,E402
+from . import oauth2 as oauth2  # noqa: F401,E402
+from . import open_id_connect_url as open_id_connect_url  # noqa: F401,E402
+from . import utils as utils  # noqa: F401,E402

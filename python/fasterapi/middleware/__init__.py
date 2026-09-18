@@ -3,3 +3,5 @@
 from __future__ import annotations
 
 from starlette.middleware import Middleware as Middleware  # noqa: F401
+
+from . import asyncexitstack as asyncexitstack  # noqa: F401

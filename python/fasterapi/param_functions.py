@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from pydantic import AliasChoices as AliasChoices  # noqa: F401
+from pydantic import AliasPath as AliasPath  # noqa: F401
+from pydantic.fields import FieldInfo as FieldInfo  # noqa: F401
+
+from . import params as params  # noqa: F401
 from .params import Body as Body  # noqa: F401
 from .params import Cookie as Cookie  # noqa: F401
 from .params import Depends as Depends  # noqa: F401

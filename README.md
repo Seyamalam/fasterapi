@@ -126,9 +126,9 @@ pytest tests/ -q
 | Native (`tests/test_fasterapi_native.py`) | 6 | all passing |
 | Auth/background/encoders (`tests/test_parity_security.py`) | 8 | all passing |
 | SSE/docs-adjacent (`tests/test_parity_surface.py`) | 7 | all passing |
-| Export guard (`tests/test_exports.py`) | 2 | all passing |
+| Export guard (`tests/test_exports.py`) | 3 | all passing |
 | Thread soak (`tests/test_threads.py`) | 3 | all passing |
-| **Total** | **50** | **55 passed** |
+| **Total** | **51** | **56 passed** |
 
 Coverage: ping, path/query/header/cookie params, validation shapes (422 `loc`/`type`/`ctx`, multi-error, malformed-JSON `json_invalid`), JSON body + `response_model`, Form, file upload, DI order + `yield` teardown, `HTTPException`, custom handlers, router prefixes, OpenAPI shapes, websockets, guards, DAG, Rust bridge, OAuth2/HTTP/API-key schemes, `Security`, password-grant forms, background tasks, datetime/UUID/Enum encoding.
 <!-- PARITY:END -->
@@ -275,11 +275,11 @@ Micro fast-paths (in-process, no servers):
 
 | Check | Baseline | fasterapi | Speedup |
 |---|---|---|---|
-| JSON `loads` | 0.0389s stdlib | 0.0654s SIMD | x0.59 |
-| JSON `dumps` | stdlib | Rust bridge | x1.19 |
-| Model validate (`loads`+`validate_python` vs `validate_json`) | 0.0047s | 0.0021s | x2.22 |
-| Model dump (`dump_python`+`dumps` vs `dump_json`) | 0.006s | 0.002s | x3.02 |
-| Router match | 0.2736s Python | 0.086s `matchit` | x3.18 |
+| JSON `loads` | 0.0369s stdlib | 0.0644s SIMD | x0.57 |
+| JSON `dumps` | stdlib | Rust bridge | x1.14 |
+| Model validate (`loads`+`validate_python` vs `validate_json`) | 0.0046s | 0.002s | x2.26 |
+| Model dump (`dump_python`+`dumps` vs `dump_json`) | 0.006s | 0.002s | x2.94 |
+| Router match | 0.2737s Python | 0.0851s `matchit` | x3.22 |
 
 Macro load (loopback, httpx concurrency; last full run):
 

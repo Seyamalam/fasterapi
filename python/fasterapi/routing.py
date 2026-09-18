@@ -19,18 +19,45 @@ from typing import Any, Callable, Coroutine, Optional, Union, get_origin
 from pydantic import BaseModel, TypeAdapter
 from starlette.background import BackgroundTasks
 from starlette.concurrency import iterate_in_threadpool
+from starlette.concurrency import run_in_threadpool as run_in_threadpool  # noqa: F401
+from starlette.datastructures import FormData as FormData  # noqa: F401
+from starlette.datastructures import URL as URL  # noqa: F401
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
+from starlette.responses import PlainTextResponse as PlainTextResponse  # noqa: F401
+from starlette.responses import RedirectResponse as RedirectResponse  # noqa: F401
+from starlette.routing import Match as Match  # noqa: F401
+from starlette.routing import Mount as Mount  # noqa: F401
+from starlette.routing import NoMatchFound as NoMatchFound  # noqa: F401
 from starlette.routing import Route as StarletteRoute
+from starlette.routing import URLPath as URLPath  # noqa: F401
+from starlette.routing import BaseRoute as BaseRoute  # noqa: F401
 from starlette.routing import WebSocketRoute
+from starlette.routing import compile_path as compile_path  # noqa: F401
+from starlette.routing import request_response as request_response  # noqa: F401
+from starlette.routing import websocket_session as websocket_session  # noqa: F401
+from starlette.routing import wrap_app_handling_exceptions as wrap_app_handling_exceptions  # noqa: F401
+from starlette.staticfiles import StaticFiles as StaticFiles  # noqa: F401
+from starlette.types import AppType as AppType  # noqa: F401
 from starlette.websockets import WebSocket
 
 from . import _rust_bridge as _bridge
+from . import params as params  # noqa: F401 (surface parity)
 from .encoders import jsonable_encoder
+from .exceptions import EndpointContext as EndpointContext  # noqa: F401
+from .exceptions import FastAPIError as FastAPIError  # noqa: F401
 from .exceptions import HTTPException, RequestValidationError
+from .exceptions import ResponseValidationError
+from .exceptions import WebSocketRequestValidationError as WebSocketRequestValidationError  # noqa: F401
 from .params import Depends, Param
 from .params import _UNSET as _PARAM_UNSET
 from .security import SecurityScopes
+from .sse import EventSourceResponse as EventSourceResponse  # noqa: F401
+from .sse import ServerSentEvent as ServerSentEvent  # noqa: F401
+from .sse import format_sse_event as format_sse_event  # noqa: F401
+from .types import DecoratedCallable as DecoratedCallable  # noqa: F401
+from .utils import generate_unique_id as generate_unique_id  # noqa: F401
+from .utils import is_body_allowed_for_status_code as is_body_allowed_for_status_code  # noqa: F401
 
 #: Cache key sharing one BackgroundTasks instance across an endpoint and its
 #: whole dependency subtree (mirrors FastAPI's per-request instance).
@@ -787,6 +814,7 @@ class _RouteDef:
         response_model_exclude_unset: bool = False,
         response_model_exclude_defaults: bool = False,
         response_model_exclude_none: bool = False,
+        operation_id: Optional[str] = None,
         tags: Optional[list[str]] = None,
         summary: Optional[str] = None,
         description: Optional[str] = None,
@@ -806,6 +834,7 @@ class _RouteDef:
         self.response_model_exclude_unset = response_model_exclude_unset
         self.response_model_exclude_defaults = response_model_exclude_defaults
         self.response_model_exclude_none = response_model_exclude_none
+        self.operation_id = operation_id
         self.tags = tags or []
         self.summary = summary
         self.description = description
@@ -1106,6 +1135,7 @@ class APIRouter:
         response_model_exclude_unset: bool = False,
         response_model_exclude_defaults: bool = False,
         response_model_exclude_none: bool = False,
+        operation_id: Optional[str] = None,
         dependencies: Optional[list[Depends]] = None,
         name: Optional[str] = None,
         **_extra: Any,
@@ -1131,6 +1161,7 @@ class APIRouter:
                 response_model_exclude_unset=response_model_exclude_unset,
                 response_model_exclude_defaults=response_model_exclude_defaults,
                 response_model_exclude_none=response_model_exclude_none,
+                operation_id=operation_id,
                 tags=[*(self.tags or []), *(tags or [])],
                 summary=summary, description=description,
                 dependencies=[*self.dependencies, *(dependencies or [])],
@@ -1212,6 +1243,7 @@ class APIRouter:
                 response_model_exclude_unset=r.response_model_exclude_unset,
                 response_model_exclude_defaults=r.response_model_exclude_defaults,
                 response_model_exclude_none=r.response_model_exclude_none,
+                operation_id=r.operation_id,
                 tags=[*r.tags, *extra_tags], summary=r.summary,
                 description=r.description,
                 dependencies=[*r.dependencies, *extra_deps], name=r.name,

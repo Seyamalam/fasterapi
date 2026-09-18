@@ -9,14 +9,28 @@ FastAPI (default value carries the metadata).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Callable, Optional
+
+from pydantic import AliasChoices as AliasChoices  # noqa: F401
+from pydantic import AliasPath as AliasPath  # noqa: F401
+from pydantic.fields import FieldInfo as FieldInfo  # noqa: F401
+
+from .exceptions import FastAPIDeprecationWarning as FastAPIDeprecationWarning  # noqa: F401
 
 _UNSET: Any = object()
 
 
+class ParamTypes(str, Enum):
+    query = "query"
+    header = "header"
+    path = "path"
+    cookie = "cookie"
+
+
 @dataclass
 class Param:
-    in_: str  # "path" | "query" | "header" | "cookie" | "body" | "form" | "file"
+    in_: str  # ParamTypes value ("path" | "query" | "header" | "cookie" | "body" | "form" | "file")
     default: Any = _UNSET
     alias: Optional[str] = None
     title: Optional[str] = None
@@ -30,6 +44,14 @@ class Param:
     pattern: Optional[str] = None
     embed: bool = False
     extra: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # Normalize to ParamTypes like upstream (str-enum: == str still holds).
+        if isinstance(self.in_, str) and not isinstance(self.in_, ParamTypes):
+            try:
+                self.in_ = ParamTypes(self.in_)
+            except ValueError:
+                pass
 
     def has_default(self) -> bool:
         return self.default is not _UNSET
