@@ -1,4 +1,4 @@
-"""fasterapi — 1:1 FastAPI drop-in powered by a Rust (Tokio + Hyper + PyO3) core.
+"""fasterapi — 1:1 FastAPI drop-in with a native Rust (PyO3) core.
 
 Drop-in migration is one import change::
 
@@ -6,15 +6,14 @@ Drop-in migration is one import change::
     #  ──▶
     from fasterapi import FastAPI, Depends, HTTPException, Query, Path, Body, APIRouter
 
-Phase 1 (this release): total interface parity on a Starlette host with
-Pydantic v2 validation, ``Depends`` DI (sub-deps, cache, ``yield`` teardown),
-``HTTPException``/``RequestValidationError`` handlers, lifespan, middleware,
-``TestClient`` and OpenAPI.
+Parity: decorators, params, Pydantic v2 validation, ``Depends``/``Security``
+DI (sub-deps, cache, ``yield`` teardown), ``BackgroundTasks``, security
+schemes, ``HTTPException``/``RequestValidationError`` handlers, lifespan,
+middleware, ``TestClient`` and OpenAPI.
 
-Phase 2 (accelerating): ``app.build()`` AOT-compiles ``Depends()`` graphs
-into a Rust DAG + radix router (``matchit``); JSON takes the SIMD fast-path
-(``simd-json``); guards run at the socket level (``governor``). Set
-``FASTERAPI_HYPER=1`` once the inverted-runtime host is promoted.
+Speed: ``app.build()`` AOT-compiles ``Depends()`` graphs into a Rust DAG +
+radix router (``matchit``); scalars validate in Rust; Pydantic bodies take
+the single-pass ``validate_json`` path and responses the ``dump_json`` path.
 """
 
 from __future__ import annotations
@@ -22,10 +21,13 @@ from __future__ import annotations
 from . import _rust_bridge as _rust_bridge  # noqa: F401
 from ._version import __version__
 from .applications import FastAPI
+from .background import BackgroundTask, BackgroundTasks
 from .dag import CompiledDAG, compile_app_dag, compile_endpoint_dag
+from .datastructures import UploadFile
+from .encoders import jsonable_encoder
 from .exceptions import HTTPException, RequestValidationError, ResponseValidationError, WebSocketException
 from .guards import APIKeyGuard, RateLimiter, api_key_dependency
-from .params import Body, Cookie, Depends, File, Form, Header, Path, Query
+from .params import Body, Cookie, Depends, File, Form, Header, Path, Query, Security
 from .responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response, StreamingResponse
 from .routing import APIRouter
 from .testclient import TestClient
@@ -52,6 +54,7 @@ __all__ = [
     "FastAPI",
     "APIRouter",
     "Depends",
+    "Security",
     "HTTPException",
     "WebSocketException",
     "RequestValidationError",
@@ -63,6 +66,10 @@ __all__ = [
     "Cookie",
     "Form",
     "File",
+    "UploadFile",
+    "BackgroundTasks",
+    "BackgroundTask",
+    "jsonable_encoder",
     "TestClient",
     "Response",
     "JSONResponse",

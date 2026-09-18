@@ -10,10 +10,12 @@ shaped like FastAPI (``{"detail": [...]}``, 422).
 from __future__ import annotations
 
 import inspect
+import json as _stdlib_json
 from contextlib import AsyncExitStack
 from typing import Any, Callable, Coroutine, Optional, Union, get_origin
 
 from pydantic import BaseModel, TypeAdapter
+from starlette.background import BackgroundTasks
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route as StarletteRoute
@@ -21,8 +23,14 @@ from starlette.routing import WebSocketRoute
 from starlette.websockets import WebSocket
 
 from . import _rust_bridge as _bridge
+from .encoders import jsonable_encoder
 from .exceptions import HTTPException, RequestValidationError
 from .params import Depends, Param
+from .security import SecurityScopes
+
+#: Cache key sharing one BackgroundTasks instance across an endpoint and its
+#: whole dependency subtree (mirrors FastAPI's per-request instance).
+_BG_KEY = "fasterapi:background-tasks"
 
 
 # ------------------------------------------------------------------ utils ---
@@ -279,6 +287,7 @@ async def _solve_fn_kwargs(
     form: Optional[dict[str, Any]],
     cache: dict[int, Any],
     stack: AsyncExitStack,
+    body_raw: Optional[bytes] = None,
 ) -> dict[str, Any]:
     """Resolve kwargs for an endpoint *or* a dependency (recursive)."""
     try:
@@ -297,6 +306,18 @@ async def _solve_fn_kwargs(
             if _is_request_annotation(ann) or (pname == "request" and ann is inspect.Parameter.empty and default is inspect.Parameter.empty):
                 kwargs[pname] = request
                 continue
+
+        # --- BackgroundTasks / SecurityScopes (framework-owned) ---------------
+        if ann is BackgroundTasks or (isinstance(ann, str) and ann == "BackgroundTasks"):
+            tasks = cache.get(_BG_KEY)
+            if tasks is None:
+                tasks = BackgroundTasks()
+                cache[_BG_KEY] = tasks
+            kwargs[pname] = tasks
+            continue
+        if ann is SecurityScopes or (isinstance(ann, str) and ann == "SecurityScopes"):
+            kwargs[pname] = SecurityScopes()
+            continue
 
         # --- Depends ----------------------------------------------------------
         if isinstance(default, Depends):
@@ -317,7 +338,7 @@ async def _solve_fn_kwargs(
                 sub_kwargs = await _solve_fn_kwargs(
                     dep_fn.__init__, request=request, path_params=path_params, query=query,
                     headers=headers, cookies=cookies, body_json=body_json, form=form,
-                    cache=cache, stack=stack,
+                    cache=cache, stack=stack, body_raw=body_raw,
                 )
                 sub_kwargs.pop("self", None)
                 try:
@@ -331,7 +352,7 @@ async def _solve_fn_kwargs(
             sub_kwargs = await _solve_fn_kwargs(
                 dep_fn, request=request, path_params=path_params, query=query,
                 headers=headers, cookies=cookies, body_json=body_json, form=form,
-                cache=cache, stack=stack,
+                cache=cache, stack=stack, body_raw=body_raw,
             )
             value = await _call_with_teardown(dep_fn, sub_kwargs, stack)
             if default.use_cache:
@@ -423,20 +444,20 @@ async def _solve_fn_kwargs(
                         kwargs[pname] = val
             elif meta.in_ in ("body", "form", "file"):
                 # handled below via body/form
-                val, err = _resolve_body_param(
-                    pname, ann, meta, body_json, form, request
+                val, errs = _resolve_body_param(
+                    pname, ann, meta, body_json, form, request, body_raw
                 )
-                if err:
-                    errors.append(err)
+                if errs:
+                    errors.extend(errs)
                 else:
                     kwargs[pname] = val
             continue
 
         # --- Pydantic model without marker -> body ----------------------------
         if _is_pydantic_model(ann):
-            val, err = _resolve_body_param(pname, ann, None, body_json, form, request)
-            if err:
-                errors.append(err)
+            val, errs = _resolve_body_param(pname, ann, None, body_json, form, request, body_raw)
+            if errs:
+                errors.extend(errs)
             else:
                 kwargs[pname] = val
             continue
@@ -469,6 +490,36 @@ async def _solve_fn_kwargs(
     return kwargs
 
 
+def _pydantic_errors(exc: Exception, loc_prefix: list[str], payload: Any) -> list[dict[str, Any]]:
+    """Map ALL pydantic errors (FastAPI returns every failure, not the first)."""
+    errs = exc.errors() if hasattr(exc, "errors") else [{"msg": str(exc), "type": "value_error"}]
+    out = []
+    for e in errs:
+        out.append({
+            "loc": loc_prefix + [str(x) for x in e.get("loc", ())],
+            "msg": str(e.get("msg", "validation error")),
+            "type": str(e.get("type", "value_error")),
+            "input": e.get("input", payload),
+        })
+        if "url" in e:
+            out[-1]["url"] = e["url"]
+    return out
+
+
+def _json_invalid_error(body_raw: bytes) -> list[dict[str, Any]]:
+    """Mirror FastAPI's malformed-JSON 422 (offset comes from the error path only)."""
+    pos: Any = 0
+    msg = "Expecting value"
+    try:
+        _stdlib_json.loads(body_raw.decode("utf-8", "replace"))
+    except _stdlib_json.JSONDecodeError as exc:
+        pos, msg = exc.pos, exc.msg
+    except Exception:
+        pass
+    return [{"loc": ["body", pos], "msg": "JSON decode error", "type": "json_invalid",
+             "input": {}, "ctx": {"error": msg}}]
+
+
 def _resolve_body_param(
     pname: str,
     ann: Any,
@@ -476,46 +527,59 @@ def _resolve_body_param(
     body_json: Any,
     form: Optional[dict[str, Any]],
     request: Request,
-) -> tuple[Any, Optional[dict[str, Any]]]:
+    body_raw: Optional[bytes] = None,
+) -> tuple[Any, list[dict[str, Any]]]:
+    no: list[dict[str, Any]] = []
     # File / UploadFile
     if ann is not inspect.Parameter.empty and getattr(ann, "__name__", "") in ("UploadFile", "FileStorage"):
         if form is not None and pname in form:
-            return form[pname], None
+            return form[pname], no
         # also check alias
         alias = (meta.alias if meta else None) or pname
         if form is not None and alias in form:
-            return form[alias], None
-        return None, {"loc": ["body", pname], "msg": "Field required", "type": "missing"}
+            return form[alias], no
+        return None, [{"loc": ["body", pname], "msg": "Field required", "type": "missing"}]
     if meta is not None and meta.in_ == "file":
         alias = meta.alias or pname
         if form is not None and (pname in form or alias in form):
-            return form.get(pname, form.get(alias)), None
-        return None, {"loc": ["body", alias], "msg": "Field required", "type": "missing"}
+            return form.get(pname, form.get(alias)), no
+        return None, [{"loc": ["body", alias], "msg": "Field required", "type": "missing"}]
     if meta is not None and meta.in_ == "form":
         alias = meta.alias or pname
         if form is not None and (pname in form or alias in form):
             raw = form.get(pname, form.get(alias))
             if ann is inspect.Parameter.empty or ann is Any:
-                return raw, None
-            return _validate_value(["body", alias], raw, ann, meta)
+                return raw, no
+            val, err = _validate_value(["body", alias], raw, ann, meta)
+            return (val, no) if err is None else (None, [err])
         if meta.has_default() and meta.default is not Ellipsis:
-            return meta.default, None
-        return None, {"loc": ["body", alias], "msg": "Field required", "type": "missing"}
+            return meta.default, no
+        return None, [{"loc": ["body", alias], "msg": "Field required", "type": "missing"}]
 
     # JSON body
     embed = bool(meta.embed) if meta else False
     alias = (meta.alias if meta else None) or pname
     if body_json is None:
+        if body_raw:
+            # Bytes arrived but unparseable -> malformed JSON (FastAPI: json_invalid).
+            return None, _json_invalid_error(body_raw)
         # No JSON payload at all.
         has_default = False
         dflt = None
         if meta is not None and meta.has_default() and meta.default is not Ellipsis:
             has_default, dflt = True, meta.default
         if has_default:
-            return dflt, None
+            return dflt, no
         # Optional[X] (default None in signature handled by caller); here required.
-        return None, {"loc": ["body", alias if embed else pname],
-                      "msg": "Field required", "type": "missing"}
+        return None, [{"loc": ["body", alias if embed else pname],
+                       "msg": "Field required", "type": "missing"}]
+    # Fast path: single Pydantic model takes the whole raw payload through
+    # `validate_json` — one Rust pass (parse + validate), no intermediate dict.
+    if _is_pydantic_model(ann) and not embed and body_raw:
+        try:
+            return _adapter(ann).validate_json(body_raw), no
+        except Exception as exc:
+            return None, _pydantic_errors(exc, ["body"], body_json)
     payload = body_json.get(alias, body_json.get(pname, _MISSING)) if isinstance(body_json, dict) and embed else (
         body_json.get(pname, body_json) if isinstance(body_json, dict) and meta is None and not _is_pydantic_model(ann) and pname in body_json
         else body_json if _is_pydantic_model(ann) or meta is None or not embed else body_json.get(alias, _MISSING)
@@ -525,19 +589,15 @@ def _resolve_body_param(
         payload = body_json
     if payload is _MISSING:
         if meta is not None and meta.has_default() and meta.default is not Ellipsis:
-            return meta.default, None
-        return None, {"loc": ["body", alias], "msg": "Field required", "type": "missing"}
+            return meta.default, no
+        return None, [{"loc": ["body", alias], "msg": "Field required", "type": "missing"}]
     if ann is inspect.Parameter.empty or ann is Any:
-        return payload, None
+        return payload, no
     try:
         value = _adapter(ann).validate_python(payload)
-        return value, None
+        return value, no
     except Exception as exc:
-        errs = exc.errors() if hasattr(exc, "errors") else [{"msg": str(exc), "type": "value_error"}]
-        first = errs[0] if errs else {}
-        loc = ["body"] + [str(x) for x in first.get("loc", (alias,))]
-        return None, {"loc": loc, "msg": str(first.get("msg", "validation error")),
-                      "type": str(first.get("type", "value_error")), "input": payload}
+        return None, _pydantic_errors(exc, ["body"], payload)
 
 
 _MISSING: Any = object()
@@ -572,13 +632,18 @@ class _RouteDef:
         self.name = name or getattr(endpoint, "__name__", path)
 
 
-def _serialize_response(result: Any, response_model: Any) -> Any:
+def _serialize_response(result: Any, response_model: Any, status_code: int = 200) -> Any:
     if isinstance(result, Response):
         return result
     if response_model is not None:
         try:
             validated = _adapter(response_model).validate_python(result)
-            return _adapter(response_model).dump_python(validated, mode="json")
+            # One Rust pass straight to JSON bytes — no intermediate dict.
+            return Response(
+                content=_adapter(response_model).dump_json(validated),
+                status_code=status_code,
+                media_type="application/json",
+            )
         except Exception as exc:
             errs = exc.errors() if hasattr(exc, "errors") else [{"msg": str(exc), "type": "value_error"}]
             from .exceptions import ResponseValidationError
@@ -589,15 +654,10 @@ def _serialize_response(result: Any, response_model: Any) -> Any:
     if result is None:
         return None
     if isinstance(result, BaseModel):
-        return result.model_dump(mode="json")
-    if isinstance(result, (dict, list, str, int, float, bool)):
-        if isinstance(result, dict):
-            # dump nested models
-            return {k: (v.model_dump(mode="json") if isinstance(v, BaseModel) else v) for k, v in result.items()}
-        if isinstance(result, list):
-            return [(v.model_dump(mode="json") if isinstance(v, BaseModel) else v) for v in result]
-        return result
-    return str(result)
+        # Rust serializer straight to bytes.
+        return Response(content=result.model_dump_json().encode("utf-8"),
+                        status_code=status_code, media_type="application/json")
+    return jsonable_encoder(result)
 
 
 def _make_http_handler(route: _RouteDef, router_deps: list[Depends]) -> Callable[[Request], Coroutine[Any, Any, Response]]:
@@ -606,7 +666,8 @@ def _make_http_handler(route: _RouteDef, router_deps: list[Depends]) -> Callable
         query = dict(request.query_params)
         headers = {k.lower(): v for k, v in request.headers.items()}
         cookies = dict(request.cookies)
-        # Body: JSON fast-path (Rust SIMD when compiled) or form.
+        # Body: keep raw bytes (validate_json fast path) + parsed views.
+        body_raw: Optional[bytes] = None
         body_json: Any = None
         form: Optional[dict[str, Any]] = None
         ctype = request.headers.get("content-type", "")
@@ -615,12 +676,13 @@ def _make_http_handler(route: _RouteDef, router_deps: list[Depends]) -> Callable
                 try:
                     raw = await request.body()
                     if raw:
+                        body_raw = bytes(raw)
                         try:
                             body_json = _bridge.fast_json_loads(raw.decode("utf-8"))
                         except Exception:
                             body_json = None
                 except Exception:
-                    body_json = None
+                    body_raw, body_json = None, None
             elif "multipart/form-data" in ctype or "application/x-www-form-urlencoded" in ctype:
                 try:
                     f = await request.form()
@@ -643,6 +705,7 @@ def _make_http_handler(route: _RouteDef, router_deps: list[Depends]) -> Callable
                         dep.dependency, request=request, path_params=path_params,
                         query=query, headers=headers, cookies=cookies,
                         body_json=body_json, form=form, cache=cache, stack=stack,
+                        body_raw=body_raw,
                     )
                     val = await _call_with_teardown(dep.dependency, sub, stack)
                     if dep.use_cache:
@@ -651,6 +714,7 @@ def _make_http_handler(route: _RouteDef, router_deps: list[Depends]) -> Callable
                     route.endpoint, request=request, path_params=path_params,
                     query=query, headers=headers, cookies=cookies,
                     body_json=body_json, form=form, cache=cache, stack=stack,
+                    body_raw=body_raw,
                 )
             except RequestValidationError as exc:
                 return JSONResponse({"detail": exc.errors()}, status_code=422)
@@ -670,7 +734,7 @@ def _make_http_handler(route: _RouteDef, router_deps: list[Depends]) -> Callable
             except RequestValidationError as exc:
                 return JSONResponse({"detail": exc.errors()}, status_code=422)
             try:
-                payload = _serialize_response(result, route.response_model)
+                payload = _serialize_response(result, route.response_model, route.status_code)
             except Exception as exc:
                 from .exceptions import ResponseValidationError
 
@@ -678,14 +742,25 @@ def _make_http_handler(route: _RouteDef, router_deps: list[Depends]) -> Callable
                     return JSONResponse({"detail": exc.errors()}, status_code=500)
                 raise
             if payload is None:
-                return Response(status_code=route.status_code)
+                return _with_background(Response(status_code=route.status_code), cache)
             if isinstance(payload, Response):
-                return payload
-            return JSONResponse(payload, status_code=route.status_code)
+                return _with_background(payload, cache)
+            return _with_background(JSONResponse(payload, status_code=route.status_code), cache)
 
     # Name the handler for Starlette route introspection.
     handler.__name__ = getattr(route.endpoint, "__name__", "handler")  # type: ignore[attr-defined]
     return handler
+
+
+def _with_background(response: Response, cache: dict[int, Any]) -> Response:
+    """Attach shared BackgroundTasks when the endpoint (or deps) queued work."""
+    try:
+        tasks = cache.get(_BG_KEY)
+        if tasks is not None and getattr(tasks, "tasks", None) and response.background is None:
+            response.background = tasks
+    except Exception:
+        pass
+    return response
 
 
 # ---------------------------------------------------------------- router ---

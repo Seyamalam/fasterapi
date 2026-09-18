@@ -256,18 +256,18 @@ Micro fast-paths (in-process, no servers):
 
 | Check | Baseline | fasterapi | Speedup |
 |---|---|---|---|
-| JSON `loads` | 0.0398s stdlib | 0.0677s SIMD | x0.59 |
-| JSON `dumps` | stdlib | Rust bridge | x0.87 |
-| Router match | 0.2927s Python | 0.0891s `matchit` | x3.29 |
+| JSON `loads` | 0.0367s stdlib | 0.0651s SIMD | x0.56 |
+| JSON `dumps` | stdlib | Rust bridge | x0.79 |
+| Router match | 0.2723s Python | 0.0834s `matchit` | x3.27 |
 
 Macro load (loopback, httpx concurrency; last full run):
 
-Run: `2026-09-18`, speedup **x1.057** (pre-push gate defaults to x1.0; strict 3x via `FASTERAPI_MIN_SPEEDUP=3.0`).
+Run: `2026-09-18`, speedup **x1.048** (pre-push gate defaults to x1.0; strict 3x via `FASTERAPI_MIN_SPEEDUP=3.0`).
 
 | Server | RPS | p50 | p90 | p99 | RSS |
 |---|---|---|---|---|---|
-| fastapi+uvicorn | 715.6 | 18.054ms | 51.834ms | 88.219ms | 53.1MB |
-| fasterapi | 756.5 | 19.151ms | 47.238ms | 92.4ms | 55.0MB |
+| fastapi+uvicorn | 710.1 | 18.847ms | 50.723ms | 99.466ms | 52.9MB |
+| fasterapi | 744.1 | 17.895ms | 47.054ms | 100.721ms | 55.1MB |
 <!-- BENCH:END -->
 
 Design rule going forward: **as much as possible in Rust,

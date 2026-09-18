@@ -161,5 +161,23 @@ class Depends:
         return f"Depends({name}, use_cache={self.use_cache})"
 
 
+class Security(Depends):
+    """Declare a security dependency — mirrors ``fastapi.Security``.
+
+    Identical to ``Depends`` plus documented ``scopes`` (used by OAuth2
+    flows and the docs generator).
+    """
+
+    def __init__(
+        self,
+        dependency: Optional[Callable[..., Any]] = None,
+        *,
+        scopes: Optional[list[str]] = None,
+        use_cache: bool = True,
+    ) -> None:
+        super().__init__(dependency, use_cache=use_cache)
+        self.scopes = scopes or []
+
+
 # Re-exported sentinel for routing introspection.
 UNSET = _UNSET
