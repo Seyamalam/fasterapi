@@ -13,6 +13,10 @@ def _client(app: FastAPI) -> F.TestClient:
     return F.TestClient(app)
 
 
+class _NativeM(BaseModel):
+    x: int
+
+
 def test_build_compiles_dag_and_router():
     app = FastAPI()
 
@@ -90,13 +94,10 @@ def test_rust_bridge_fallback_api():
 
 
 def test_json_roundtrip_models():
-    class M(BaseModel):
-        x: int
-
     app = FastAPI()
 
-    @app.post("/m", response_model=M)
-    async def m(payload: M):
+    @app.post("/m", response_model=_NativeM)
+    async def m(payload: _NativeM):
         return payload
 
     with _client(app) as c:

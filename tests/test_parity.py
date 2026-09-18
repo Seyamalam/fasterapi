@@ -37,6 +37,7 @@ from fastapi import Cookie as GCookie
 from fastapi import APIRouter as GAPIRouter
 from fastapi import FastAPI as GFastAPI
 from fastapi.testclient import TestClient as GTestClient
+from starlette.websockets import WebSocket as StarletteWS
 
 
 # ------------------------------------------------------------------ models ---
@@ -245,7 +246,7 @@ def test_path_query_validation_parity(fastapi_client, fasterapi_client):
         assert _err_shapes(a.json()["detail"]) == _err_shapes(b.json()["detail"]), path
 
 
-def test_missing_query uses_default(fastapi_client, fasterapi_client):
+def test_missing_query_uses_default(fastapi_client, fasterapi_client):
     a = fastapi_client.get("/items/7")
     b = fasterapi_client.get("/items/7")
     assert a.json()["limit"] == b.json()["limit"] == 10
@@ -294,7 +295,9 @@ def test_dependencies_order_and_teardown():
         assert ga.status_code == fa.status_code == 200
         assert ga.json()["user"] == fa.json()["user"] == "ada"
         assert g_app.state.order == f_app.state.order, (g_app.state.order, f_app.state.order)
-        assert g_app.state.order == ["db:enter", "user:enter", "user:exit", "db:exit"]
+        # Lifespan startup runs first; teardown (shutdown/db:exit) runs on exit.
+        assert g_app.state.order[0] == "startup"
+        assert g_app.state.order[1:5] == ["db:enter", "user:enter", "user:exit", "db:exit"]
 
 
 def test_http_exception_parity(fastapi_client, fasterapi_client):
@@ -330,19 +333,16 @@ def test_websocket_echo_parity():
     g_app = GFastAPI()
 
     @g_app.websocket("/ws")
-    async def _gws(ws):  # type: ignore[no-untyped-def]
-        from starlette.websockets import WebSocket as _WS
-
-        assert isinstance(ws, _WS)
-        await ws.accept()
-        data = await ws.receive_text()
-        await ws.send_text(f"echo:{data}")
-        await ws.close()
+    async def _gws(websocket: StarletteWS):  # type: ignore[no-untyped-def]
+        await websocket.accept()
+        data = await websocket.receive_text()
+        await websocket.send_text(f"echo:{data}")
+        await websocket.close()
 
     f_app = F.FastAPI()
 
     @f_app.websocket("/ws")
-    async def _fws(websocket):  # type: ignore[no-untyped-def]
+    async def _fws(websocket: StarletteWS):  # type: ignore[no-untyped-def]
         await websocket.accept()
         data = await websocket.receive_text()
         await websocket.send_text(f"echo:{data}")
