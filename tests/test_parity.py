@@ -464,6 +464,31 @@ def test_router_prefix_parity(fastapi_client, fasterapi_client):
     assert a.json() == b.json() == {"msg": "yo ada"}
 
 
+def test_empty_subpath_collection_idiom():
+    # `@router.post("")` addresses the prefix itself on both frameworks.
+    def build(cls):  # type: ignore[no-untyped-def]
+        from fasterapi import APIRouter as _FR
+        from fastapi import APIRouter as _GR
+        R = _GR if cls is GFastAPI else _FR
+        app = cls()
+        sub = R(prefix="/cols")
+
+        @sub.post("")
+        async def create():
+            return {"created": True}
+
+        @sub.get("")
+        async def listing():
+            return {"items": []}
+
+        app.include_router(sub)
+        return app
+
+    with GTestClient(build(GFastAPI)) as gc, F.TestClient(build(F.FastAPI)) as fc:
+        assert gc.post("/cols").json() == fc.post("/cols").json() == {"created": True}
+        assert gc.get("/cols").json() == fc.get("/cols").json() == {"items": []}
+
+
 def test_docs_parity(fastapi_client, fasterapi_client):
     for path in ["/docs", "/redoc", "/docs/oauth2-redirect"]:
         a = fastapi_client.get(path)

@@ -1,0 +1,5 @@
+# taskapi runtime extras (fasterapi itself installs from the repo root).
+uvicorn>=0.29
+httpx>=0.24
+python-multipart>=0.0.9
+pytest>=8.0

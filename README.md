@@ -92,6 +92,9 @@ if __name__ == "__main__":
 
 `examples/quickstart.py` is runnable as-is. Serve with `uvicorn examples.quickstart:app`.
 
+Fuller demo: [`examples/taskapi`](examples/taskapi/) is a complete backend
+project (auth, CRUD, files, SSE, background jobs, tests) with its own README.
+
 ## Parity (Phase 1)
 
 | Feature | FastAPI | fasterapi v0.1 |
@@ -119,13 +122,13 @@ pytest tests/ -q
 
 | Suite | Tests | Result |
 |---|---|---|
-| Differential (`tests/test_parity.py`, FastAPI vs fasterapi) | 23 | all passing |
+| Differential (`tests/test_parity.py`, FastAPI vs fasterapi) | 24 | all passing |
 | Native (`tests/test_fasterapi_native.py`) | 6 | all passing |
 | Auth/background/encoders (`tests/test_parity_security.py`) | 8 | all passing |
 | SSE/docs-adjacent (`tests/test_parity_surface.py`) | 7 | all passing |
 | Export guard (`tests/test_exports.py`) | 2 | all passing |
 | Thread soak (`tests/test_threads.py`) | 3 | all passing |
-| **Total** | **49** | **54 passed** |
+| **Total** | **50** | **55 passed** |
 
 Coverage: ping, path/query/header/cookie params, validation shapes (422 `loc`/`type`/`ctx`, multi-error, malformed-JSON `json_invalid`), JSON body + `response_model`, Form, file upload, DI order + `yield` teardown, `HTTPException`, custom handlers, router prefixes, OpenAPI shapes, websockets, guards, DAG, Rust bridge, OAuth2/HTTP/API-key schemes, `Security`, password-grant forms, background tasks, datetime/UUID/Enum encoding.
 <!-- PARITY:END -->
@@ -272,11 +275,11 @@ Micro fast-paths (in-process, no servers):
 
 | Check | Baseline | fasterapi | Speedup |
 |---|---|---|---|
-| JSON `loads` | 0.0707s stdlib | 0.1227s SIMD | x0.58 |
-| JSON `dumps` | stdlib | Rust bridge | x1.14 |
-| Model validate (`loads`+`validate_python` vs `validate_json`) | 0.0079s | 0.0035s | x2.25 |
-| Model dump (`dump_python`+`dumps` vs `dump_json`) | 0.0103s | 0.0035s | x2.99 |
-| Router match | 0.4583s Python | 0.1461s `matchit` | x3.14 |
+| JSON `loads` | 0.0389s stdlib | 0.0654s SIMD | x0.59 |
+| JSON `dumps` | stdlib | Rust bridge | x1.19 |
+| Model validate (`loads`+`validate_python` vs `validate_json`) | 0.0047s | 0.0021s | x2.22 |
+| Model dump (`dump_python`+`dumps` vs `dump_json`) | 0.006s | 0.002s | x3.02 |
+| Router match | 0.2736s Python | 0.086s `matchit` | x3.18 |
 
 Macro load (loopback, httpx concurrency; last full run):
 

@@ -1110,7 +1110,12 @@ class APIRouter:
         name: Optional[str] = None,
         **_extra: Any,
     ) -> None:
-        full = self.prefix + (path if path.startswith("/") else "/" + path)
+        # Empty sub-path ("@router.post(\"\")") addresses the prefix itself —
+        # no trailing slash gained (FastAPI idiom for collection routes).
+        if not path:
+            full = self.prefix or "/"
+        else:
+            full = self.prefix + (path if path.startswith("/") else "/" + path)
         rc = response_class if response_class is not None else self.default_response_class
         if rc is JSONResponse:
             rc = None  # default JSON rendering needs no marker
