@@ -39,6 +39,7 @@ verified on 3.10–3.14.
 - [Free-threading](#free-threading)
 - [Benchmarks](#benchmarks)
 - [Roadmap](#roadmap)
+- [Changelog](CHANGELOG.md) · [Migration guide](docs/migration.md)
 - [License](#license)
 
 ---
@@ -210,32 +211,31 @@ bash scripts/install_hooks.sh   # sets core.hooksPath=.githooks
 
 ```
 fasterapi/
-├── Cargo.toml                  # Rust ext: pyo3, matchit, simd-json, serde, governor, regex (minimal)
-├── pyproject.toml              # maturin (pyo3 bindings, python-source=python)
+├── Cargo.toml                  # Rust ext: pyo3, matchit, simd-json, serde, governor, regex + hyper/tokio host
+├── pyproject.toml              # maturin (pyo3 bindings, python-source=python) + `fasterapi` script
 ├── rust-toolchain.toml
-├── src/lib.rs                  # PyO3 core: router, validators, SIMD JSON, TokenBucket, DAG, host helpers
+├── src/lib.rs                  # PyO3 core: Hyper host, router, validators, SIMD JSON, guards, DAG
 ├── python/fasterapi/
 │   ├── __init__.py             # drop-in surface (FastAPI, APIRouter, Depends, …)
 │   ├── applications.py         # FastAPI(Starlette): decorators, lifespan, openapi, build(), serve()
-│   ├── routing.py              # APIRouter + validation + DI solver + ws
-│   ├── params.py               # Path/Query/Header/Cookie/Body/Form/File/Depends
-│   ├── exceptions.py           # HTTPException, RequestValidationError, …
-│   ├── responses.py            # + FileResponse(sendfile hint)
-│   ├── testclient.py           # fastapi.testclient-compatible TestClient
-│   ├── dag.py                  # AOT Depends compiler (Rust DAG when present)
-│   ├── guards.py               # RateLimiter, APIKeyGuard
+│   ├── routing.py              # APIRouter + validation + DI solver + ws + SSE
+│   ├── params.py               # Path/Query/Header/Cookie/Body/Form/File/Depends/Security
+│   ├── security.py             # OAuth2/HTTP/API-key schemes + forms
+│   ├── openapi/                # docs.py (Swagger/ReDoc) + utils.py (get_openapi)
+│   ├── sse.py                  # EventSourceResponse, ServerSentEvent
+│   ├── responses.py            # + FileResponse(sendfile), ORJSON/UJSON shims
+│   ├── encoders.py             # jsonable_encoder
+│   ├── middleware/             # cors/gzip/trustedhost/… + asyncexitstack
+│   ├── _hyper_serve.py         # Python side of the Hyper host (ASGI drive)
 │   ├── _rust_bridge.py         # HAS_RUST switch + pure-Python fallbacks
+│   ├── cli.py                  # `fasterapi run` (+ __main__.py)
 │   └── py.typed                # PEP 561: typed package
-├── tests/
-│   ├── test_parity.py          # differential suite (FastAPI vs fasterapi)
-│   └── test_fasterapi_native.py
+├── tests/                      # differential suites + guards + thread soak + hyper host
 ├── benchmarks/
 │   └── benchmark_differential.py
-├── scripts/
-│   ├── update_readme_tables.py # regenerates the auto tables in this README
-│   ├── install_hooks.sh
-│   └── quickstart.sh
-├── .githooks/{pre-push,pre-commit}
+├── scripts/                    # update_readme_tables, install_hooks, quickstart, free-threaded-check
+├── docs/migration.md
+├── CHANGELOG.md
 └── examples/quickstart.py
 ```
 
@@ -272,11 +272,11 @@ Micro fast-paths (in-process, no servers):
 
 | Check | Baseline | fasterapi | Speedup |
 |---|---|---|---|
-| JSON `loads` | 0.0444s stdlib | 0.0712s SIMD | x0.62 |
-| JSON `dumps` | stdlib | Rust bridge | x1.13 |
-| Model validate (`loads`+`validate_python` vs `validate_json`) | 0.0052s | 0.0023s | x2.22 |
-| Model dump (`dump_python`+`dumps` vs `dump_json`) | 0.0066s | 0.0022s | x2.94 |
-| Router match | 0.3043s Python | 0.0912s `matchit` | x3.34 |
+| JSON `loads` | 0.0415s stdlib | 0.0694s SIMD | x0.6 |
+| JSON `dumps` | stdlib | Rust bridge | x1.16 |
+| Model validate (`loads`+`validate_python` vs `validate_json`) | 0.0049s | 0.0022s | x2.25 |
+| Model dump (`dump_python`+`dumps` vs `dump_json`) | 0.0064s | 0.0022s | x2.95 |
+| Router match | 0.2907s Python | 0.0893s `matchit` | x3.26 |
 
 Macro load (loopback, httpx concurrency; last full run):
 
