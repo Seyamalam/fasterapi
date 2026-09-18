@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+target/
+*.so
+*.pyd
+
+# Maturin / Rust
+/target/
+Cargo.lock
+
+# Test / bench artifacts
+.pytest_cache/
+.hypothesis/
+benchmark-results/
+*.prof
+
+# OS / editors
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# Env
+.env
