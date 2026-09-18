@@ -51,6 +51,9 @@ bench = [
   "psutil>=5.9",
 ]
 
+[project.scripts]
+fasterapi = "fasterapi.cli:main"
+
 [project.urls]
 Homepage = "https://github.com/Seyamalam/fasterapi"
 Repository = "https://github.com/Seyamalam/fasterapi"
