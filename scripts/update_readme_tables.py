@@ -195,7 +195,7 @@ def render_bench(micro: dict, macro: dict | None, has_rust: bool) -> str:
             mtime = "unknown date"
         lines += [
             f"Run: `{mtime}`, speedup **x{macro.get('speedup_rps', '?')}** "
-            f"(pre-push gate defaults to x1.0; strict 3x via `FASTERAPI_MIN_SPEEDUP=3.0`).",
+            f"(pre-push: micro strict 3x + macro parity band x0.95).",
             "",
             "| Server | RPS | p50 | p90 | p99 | RSS |",
             "|---|---|---|---|---|---|",

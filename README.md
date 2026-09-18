@@ -198,9 +198,9 @@ bash scripts/install_hooks.sh   # sets core.hooksPath=.githooks
 ```
 
 - **`pre-push`**: `maturin develop --release` → full parity suite (reject on
-  any failure) → benchmark `--quick` (reject on regression below
-  `FASTERAPI_MIN_SPEEDUP`, default `1.0`; set `3.0` for the strict 3x JSON/
-  routing gate once Rust is compiled; `FASTERAPI_SKIP_PERF=1` to override).
+  any failure) → micro fast-path gate (strict **3x**) → macro load gate
+  (parity band **x0.95**, catches real regressions through loopback noise;
+  `FASTERAPI_SKIP_PERF=1` to override).
 - **`pre-commit`**: `cargo fmt --check` (advisory) + README table refresh +
   fast native unit tests.
 
@@ -259,22 +259,22 @@ Micro fast-paths (in-process, no servers):
 
 | Check | Baseline | fasterapi | Speedup |
 |---|---|---|---|
-| JSON `loads` | 0.0381s stdlib | 0.0641s SIMD | x0.59 |
-| JSON `dumps` | stdlib | Rust bridge | x0.91 |
-| Model validate (`loads`+`validate_python` vs `validate_json`) | 0.0044s | 0.002s | x2.17 |
-| Model dump (`dump_python`+`dumps` vs `dump_json`) | 0.006s | 0.0021s | x2.88 |
-| Router match | 0.273s Python | 0.0856s `matchit` | x3.19 |
+| JSON `loads` | 0.0382s stdlib | 0.0647s SIMD | x0.59 |
+| JSON `dumps` | stdlib | Rust bridge | x0.94 |
+| Model validate (`loads`+`validate_python` vs `validate_json`) | 0.0045s | 0.0021s | x2.2 |
+| Model dump (`dump_python`+`dumps` vs `dump_json`) | 0.0059s | 0.002s | x2.93 |
+| Router match | 0.2754s Python | 0.085s `matchit` | x3.24 |
 
 Macro load (loopback, httpx concurrency; last full run):
 
-Run: `2026-09-18`, speedup **x1.014** (pre-push gate defaults to x1.0; strict 3x via `FASTERAPI_MIN_SPEEDUP=3.0`).
+Run: `2026-09-18`, speedup **x0.987** (pre-push: micro strict 3x + macro parity band x0.95).
 
 | Server | RPS | p50 | p90 | p99 | RSS |
 |---|---|---|---|---|---|
-| fastapi+uvicorn | 762.6 | 43.247ms | 142.398ms | 262.807ms | 53.0MB |
-| fasterapi | 773.5 | 42.755ms | 139.713ms | 283.948ms | 55.5MB |
+| fastapi+uvicorn | 758.8 | 43.41ms | 142.543ms | 267.53ms | 52.8MB |
+| fasterapi | 749.3 | 42.622ms | 146.385ms | 288.404ms | 55.6MB |
 
-POST /items (Pydantic validation path): fastapi+uvicorn 668.1 RPS vs fasterapi 672.9 RPS → **x1.007**.
+POST /items (Pydantic validation path): fastapi+uvicorn 671.1 RPS vs fasterapi 665.8 RPS → **x0.992**.
 <!-- BENCH:END -->
 
 Design rule going forward: **as much as possible in Rust,

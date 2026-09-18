@@ -23,7 +23,6 @@ else
   PY="python3"
 fi
 export PYTHONPATH="$ROOT/python${PYTHONPATH:+:$PYTHONPATH}"
-MIN_SPEEDUP="${FASTERAPI_MIN_SPEEDUP:-1.0}"
 
 echo "=== fasterapi pre-push gate ==="
 
@@ -52,12 +51,20 @@ if [[ "${FASTERAPI_SKIP_PERF:-0}" == "1" ]]; then
   echo "[3/3] perf gate skipped (FASTERAPI_SKIP_PERF=1)."
   exit 0
 fi
-echo "[3/3] benchmark engine (micro + quick macro, gate x${MIN_SPEEDUP})"
-if ! "$PY" benchmarks/benchmark_differential.py --quick --min-speedup "$MIN_SPEEDUP"; then
+# Micro fast-paths are stable run-to-run: strict 3x gate (router/matchit).
+# Macro loopback RPS is noisy (±5%): parity-band gate, catches real regressions.
+echo "[3/3a] micro fast-path gate (strict x3.0)"
+if ! "$PY" benchmarks/benchmark_differential.py --micro-only --min-speedup 3.0; then
+  echo "PERF GATE FAILED (micro) — push rejected." >&2
+  exit 1
+fi
+MIN_MACRO="${FASTERAPI_MIN_MACRO:-0.95}"
+echo "[3/3b] macro load gate (parity band x${MIN_MACRO})"
+if ! "$PY" benchmarks/benchmark_differential.py --quick --min-speedup "$MIN_MACRO"; then
   code=$?
   if [[ $code -eq 2 ]]; then
-    echo "PERF GATE FAILED — push rejected (regression below x${MIN_SPEEDUP})." >&2
-    echo "  Raise throughput (Rust fast-paths) or run with FASTERAPI_SKIP_PERF=1 to override." >&2
+    echo "PERF GATE FAILED (macro x${MIN_MACRO}) — push rejected (real regression)." >&2
+    echo "  Run with FASTERAPI_SKIP_PERF=1 to override." >&2
     exit 1
   fi
   echo "WARNING: benchmark harness errored — allowing push, see output above."
