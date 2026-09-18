@@ -27,6 +27,8 @@ from fasterapi import Path as FPath
 from fasterapi import Header as FHeader
 from fasterapi import Cookie as FCookie
 from fasterapi import Body as FBody
+from fasterapi import Form as FForm
+from fasterapi import File as FFile
 
 from fastapi import Depends as GDepends
 from fastapi import HTTPException as GHTTPException
@@ -34,9 +36,13 @@ from fastapi import Query as GQuery
 from fastapi import Path as GPath
 from fastapi import Header as GHeader
 from fastapi import Cookie as GCookie
+from fastapi import Form as GForm
+from fastapi import File as GFile
+from fastapi import UploadFile as GUploadFile
 from fastapi import APIRouter as GAPIRouter
 from fastapi import FastAPI as GFastAPI
 from fastapi.testclient import TestClient as GTestClient
+from starlette.datastructures import UploadFile as StarletteUploadFile
 from starlette.websockets import WebSocket as StarletteWS
 
 
@@ -99,6 +105,15 @@ def build_fastapi_app() -> GFastAPI:
     @app.get("/needs-auth")
     async def needs_auth(user= GDepends(get_user)):
         return user
+
+    @app.post("/login")
+    async def login(username: str = GForm(), password: str = GForm(min_length=4)):
+        return {"user": username, "ok": len(password) >= 4}
+
+    @app.post("/upload")
+    async def upload(file: GUploadFile = GFile()):
+        content = await file.read()
+        return {"filename": file.filename, "content_type": file.content_type, "size": len(content)}
 
     @app.get("/boom/{code}")
     async def boom(code: int):
@@ -167,6 +182,15 @@ def build_fasterapi_app() -> F.FastAPI:
     @app.get("/needs-auth")
     async def needs_auth(user=FDepends(get_user)):
         return user
+
+    @app.post("/login")
+    async def login(username: str = FForm(), password: str = FForm(min_length=4)):
+        return {"user": username, "ok": len(password) >= 4}
+
+    @app.post("/upload")
+    async def upload(file: StarletteUploadFile = FFile()):
+        content = await file.read()
+        return {"filename": file.filename, "content_type": file.content_type, "size": len(content)}
 
     @app.get("/boom/{code}")
     async def boom(code: int):
@@ -284,6 +308,34 @@ def test_headers_cookies_parity(fastapi_client, fasterapi_client):
     a = fastapi_client.get("/cookies-test", cookies={"session": "s3cr3t"})
     b = fasterapi_client.get("/cookies-test", cookies={"session": "s3cr3t"})
     assert a.json() == b.json() == {"session": "s3cr3t"}
+
+
+def test_form_parity(fastapi_client, fasterapi_client):
+    a = fastapi_client.post("/login", data={"username": "ada", "password": "s3cr3t"})
+    b = fasterapi_client.post("/login", data={"username": "ada", "password": "s3cr3t"})
+    assert a.status_code == b.status_code == 200
+    assert a.json() == b.json() == {"user": "ada", "ok": True}
+
+
+def test_form_validation_parity(fastapi_client, fasterapi_client):
+    a = fastapi_client.post("/login", data={"username": "ada", "password": "x"})
+    b = fasterapi_client.post("/login", data={"username": "ada", "password": "x"})
+    assert a.status_code == 422, a.json()
+    assert b.status_code == 422, b.json()
+    assert _err_shapes(a.json()["detail"]) == _err_shapes(b.json()["detail"])
+
+    a = fastapi_client.post("/login", data={"username": "ada"})
+    b = fasterapi_client.post("/login", data={"username": "ada"})
+    assert a.status_code == b.status_code == 422
+    assert _err_shapes(a.json()["detail"]) == _err_shapes(b.json()["detail"])
+
+
+def test_file_upload_parity(fastapi_client, fasterapi_client):
+    files = {"file": ("hello.txt", b"hello fasterapi", "text/plain")}
+    a = fastapi_client.post("/upload", files=files)
+    b = fasterapi_client.post("/upload", files=files)
+    assert a.status_code == b.status_code == 200
+    assert a.json() == b.json() == {"filename": "hello.txt", "content_type": "text/plain", "size": 15}
 
 
 def test_dependencies_order_and_teardown():

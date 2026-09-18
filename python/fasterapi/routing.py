@@ -497,11 +497,9 @@ def _resolve_body_param(
             raw = form.get(pname, form.get(alias))
             if ann is inspect.Parameter.empty or ann is Any:
                 return raw, None
-            return _validate_value(["body", alias], raw, ann, None)
+            return _validate_value(["body", alias], raw, ann, meta)
         if meta.has_default() and meta.default is not Ellipsis:
             return meta.default, None
-        ctxt = request.headers.get("content-type", "") if hasattr(request, "headers") else ""
-        _ = ctxt
         return None, {"loc": ["body", alias], "msg": "Field required", "type": "missing"}
 
     # JSON body
