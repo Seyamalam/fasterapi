@@ -95,6 +95,13 @@ if __name__ == "__main__":
 Fuller demo: [`examples/taskapi`](examples/taskapi/) is a complete backend
 project (auth, CRUD, files, SSE, background jobs, tests) with its own README.
 
+Side-by-side speed/parity audit vs real FastAPI: [`examples/comparison`](examples/comparison/)
+runs two identical projects (one per framework) through a growing complexity
+ladder — DB, auth, jobs, streaming — comparing outputs probe-by-probe and
+RPS/latency per stage. The generated report ([`examples/comparison/AUDIT.md`](examples/comparison/AUDIT.md))
+has already caught and fixed three parity bugs (422 `ctx`/`url` shape,
+malformed-JSON-before-auth ordering, auto-`HEAD` on GET routes).
+
 ## Parity (Phase 1)
 
 | Feature | FastAPI | fasterapi v0.1 |
@@ -275,11 +282,11 @@ Micro fast-paths (in-process, no servers):
 
 | Check | Baseline | fasterapi | Speedup |
 |---|---|---|---|
-| JSON `loads` | 0.0369s stdlib | 0.0644s SIMD | x0.57 |
-| JSON `dumps` | stdlib | Rust bridge | x1.14 |
-| Model validate (`loads`+`validate_python` vs `validate_json`) | 0.0046s | 0.002s | x2.26 |
-| Model dump (`dump_python`+`dumps` vs `dump_json`) | 0.006s | 0.002s | x2.94 |
-| Router match | 0.2737s Python | 0.0851s `matchit` | x3.22 |
+| JSON `loads` | 0.0472s stdlib | 0.0858s SIMD | x0.55 |
+| JSON `dumps` | stdlib | Rust bridge | x1.1 |
+| Model validate (`loads`+`validate_python` vs `validate_json`) | 0.0062s | 0.0028s | x2.2 |
+| Model dump (`dump_python`+`dumps` vs `dump_json`) | 0.0081s | 0.0027s | x2.95 |
+| Router match | 0.354s Python | 0.1094s `matchit` | x3.24 |
 
 Macro load (loopback, httpx concurrency; last full run):
 

@@ -172,10 +172,10 @@ def _check_constraints(name: str, loc: list[str], value: Any, meta: Optional[Par
     if isinstance(value, str):
         if meta.min_length is not None and len(value) < meta.min_length:
             return {"loc": loc, "msg": f"String should have at least {meta.min_length} characters",
-                    "type": "string_too_short", "input": value}
+                    "type": "string_too_short", "input": value, "ctx": {"min_length": meta.min_length}}
         if meta.max_length is not None and len(value) > meta.max_length:
             return {"loc": loc, "msg": f"String should have at most {meta.max_length} characters",
-                    "type": "string_too_long", "input": value}
+                    "type": "string_too_long", "input": value, "ctx": {"max_length": meta.max_length}}
         if meta.pattern is not None:
             import re
 
@@ -186,16 +186,16 @@ def _check_constraints(name: str, loc: list[str], value: Any, meta: Optional[Par
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         if meta.ge is not None and value < meta.ge:
             return {"loc": loc, "msg": f"Input should be greater than or equal to {meta.ge}",
-                    "type": "greater_than_equal", "input": value}
+                    "type": "greater_than_equal", "input": value, "ctx": {"ge": meta.ge}}
         if meta.le is not None and value > meta.le:
             return {"loc": loc, "msg": f"Input should be less than or equal to {meta.le}",
-                    "type": "less_than_equal", "input": value}
+                    "type": "less_than_equal", "input": value, "ctx": {"le": meta.le}}
         if meta.gt is not None and value <= meta.gt:
             return {"loc": loc, "msg": f"Input should be greater than {meta.gt}",
-                    "type": "greater_than", "input": value}
+                    "type": "greater_than", "input": value, "ctx": {"gt": meta.gt}}
         if meta.lt is not None and value >= meta.lt:
             return {"loc": loc, "msg": f"Input should be less than {meta.lt}",
-                    "type": "less_than", "input": value}
+                    "type": "less_than", "input": value, "ctx": {"lt": meta.lt}}
     return None
 
 
@@ -284,6 +284,15 @@ def _validate_value(loc: list[str], raw: Any, annotation: Any, meta: Optional[Pa
             err: dict[str, Any] = {"loc": loc, "msg": msg, "type": err_type, "input": raw}
             if err_type == "string_pattern_mismatch" and meta and meta.pattern:
                 err["ctx"] = {"pattern": meta.pattern}
+            elif err_type in ("greater_than_equal", "less_than_equal", "greater_than", "less_than"):
+                import re as _re
+
+                m = _re.search(r"(-?\d+(?:\.\d+)?)\s*$", msg)
+                if m:
+                    num = float(m.group(1))
+                    key = {"greater_than_equal": "ge", "less_than_equal": "le",
+                           "greater_than": "gt", "less_than": "lt"}[err_type]
+                    err["ctx"] = {key: int(num) if (num.is_integer() and ann is int) else num}
             return None, err
     # bool query strings need normalization before pydantic
     if ann is bool and isinstance(raw, str):
@@ -297,11 +306,14 @@ def _validate_value(loc: list[str], raw: Any, annotation: Any, meta: Optional[Pa
     except Exception as exc:
         errs = getattr(exc, "errors", None)
         if callable(errs):
-            first = errs()[0] if errs() else {}
-            return None, {"loc": loc + list(first.get("loc", ())),
-                          "msg": str(first.get("msg", "validation error")),
-                          "type": str(first.get("type", "value_error")),
-                          "input": raw}
+            first = errs(include_url=False)[0] if errs() else {}
+            err: dict[str, Any] = {"loc": loc + list(first.get("loc", ())),
+                                   "msg": str(first.get("msg", "validation error")),
+                                   "type": str(first.get("type", "value_error")),
+                                   "input": raw}
+            if "ctx" in first:
+                err["ctx"] = first["ctx"]
+            return None, err
         return None, {"loc": loc, "msg": str(exc), "type": "value_error", "input": raw}
     err = _check_constraints("", loc, value, meta)
     if err is not None:
@@ -611,18 +623,23 @@ def _json_body_type(ann: Any) -> bool:
 
 
 def _pydantic_errors(exc: Exception, loc_prefix: list[str], payload: Any) -> list[dict[str, Any]]:
-    """Map ALL pydantic errors (FastAPI returns every failure, not the first)."""
-    errs = exc.errors() if hasattr(exc, "errors") else [{"msg": str(exc), "type": "value_error"}]
+    """Map ALL pydantic errors (FastAPI returns every failure, not the first).
+
+    Wire shape mirrors FastAPI: pydantic errors with ``include_url=False``
+    (no ``url`` key) + FastAPI's ``loc`` prefix. ``ctx`` is preserved.
+    """
+    errs = exc.errors(include_url=False) if hasattr(exc, "errors") else [{"msg": str(exc), "type": "value_error"}]
     out = []
     for e in errs:
-        out.append({
+        item = {
             "loc": loc_prefix + [str(x) for x in e.get("loc", ())],
             "msg": str(e.get("msg", "validation error")),
             "type": str(e.get("type", "value_error")),
             "input": e.get("input", payload),
-        })
-        if "url" in e:
-            out[-1]["url"] = e["url"]
+        }
+        if "ctx" in e:
+            item["ctx"] = e["ctx"]
+        out.append(item)
     return out
 
 
@@ -940,6 +957,7 @@ def _make_http_handler(route: _RouteDef, router_deps: list[Depends]) -> Callable
         # straight from bytes; anything else parses lazily (cached) on use.
         body_raw: Optional[bytes] = None
         form: Optional[dict[str, Any]] = None
+        body_json: Any = None
         ctype = request.headers.get("content-type", "")
         if request.method in ("POST", "PUT", "PATCH", "DELETE"):
             if "application/json" in ctype or (ctype == "" and (request.headers.get("content-length", "0") != "0")):
@@ -957,6 +975,14 @@ def _make_http_handler(route: _RouteDef, router_deps: list[Depends]) -> Callable
                         form[k] = v
                 except Exception:
                     form = {}
+        # FastAPI parity: detect malformed JSON *before* solving dependencies,
+        # so a broken body 422s (json_invalid) even when auth would 401 first.
+        if body_raw:
+            try:
+                body_json = _parsed_json_cached(request, body_raw)
+            except _InvalidJson:
+                await JSONResponse({"detail": _json_invalid_error(body_raw)}, status_code=422)(scope, receive, send)
+                return
         async with AsyncExitStack() as stack:
             cache: dict[int, Any] = {}
             try:
@@ -969,7 +995,7 @@ def _make_http_handler(route: _RouteDef, router_deps: list[Depends]) -> Callable
                     sub = await _solve_fn_kwargs(
                         dep.dependency, request=request, path_params=path_params,
                         query=query, headers=headers, cookies=cookies,
-                        body_json=None, form=form, cache=cache, stack=stack,
+                        body_json=body_json, form=form, cache=cache, stack=stack,
                         body_raw=body_raw,
                     )
                     val = await _call_with_teardown(dep.dependency, sub, stack)
@@ -978,7 +1004,7 @@ def _make_http_handler(route: _RouteDef, router_deps: list[Depends]) -> Callable
                 kwargs = await _solve_fn_kwargs(
                     route.endpoint, request=request, path_params=path_params,
                     query=query, headers=headers, cookies=cookies,
-                    body_json=None, form=form, cache=cache, stack=stack,
+                    body_json=body_json, form=form, cache=cache, stack=stack,
                     body_raw=body_raw,
                 )
             except RequestValidationError as exc:
@@ -1263,6 +1289,8 @@ class APIRouter:
             # request_response wrapper which expects (Request) -> Response.
             sr = StarletteRoute(r.path, lambda _req: Response(status_code=500),  # placeholder
                                 methods=r.methods, name=r.name)
+            # FastAPI parity: GET-only routes do not auto-serve HEAD.
+            sr.methods = set(r.methods)
             sr.app = _make_http_handler(r, [])
             out.append(sr)
         for path, fn, name in self.websocket_routes:
