@@ -152,11 +152,14 @@ def render_parity(passed: int, failed: int) -> str:
         "",
         "Coverage: ping, path/query/header/cookie params, validation shapes "
         "(422 `loc`/`type`/`ctx`, multi-error, malformed-JSON `json_invalid`), "
-        "JSON body + `response_model`, Form, file upload, DI order + `yield` "
-        "teardown, `HTTPException`, custom handlers, router prefixes, OpenAPI "
-        "shapes, websockets, guards, DAG, Rust bridge, OAuth2/HTTP/API-key "
-        "schemes, `Security`, password-grant forms, background tasks, "
-        "datetime/UUID/Enum encoding.",
+        "JSON body + `response_model` (+flags, return-annotation fallback), Form, "
+        "file upload, DI order + `yield` teardown, `HTTPException`, custom "
+        "handlers, router prefixes, OpenAPI shapes (full-spec equality, "
+        "securitySchemes, webhooks), websockets (+auth), guards, DAG, Rust "
+        "bridge, OAuth2/HTTP/API-key schemes, `Security`, password-grant "
+        "forms, background tasks, datetime/UUID/Enum encoding, export surface, "
+        "thread soak, Hyper host (file bytes, 413, middleware fallback, "
+        "graceful lifespan, ws echo/auth).",
         PARITY_END,
     ])
 

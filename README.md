@@ -137,7 +137,7 @@ pytest tests/ -q
 | Thread soak (`tests/test_threads.py`) | 3 | all passing |
 | **Total** | **52** | **58 passed** |
 
-Coverage: ping, path/query/header/cookie params, validation shapes (422 `loc`/`type`/`ctx`, multi-error, malformed-JSON `json_invalid`), JSON body + `response_model`, Form, file upload, DI order + `yield` teardown, `HTTPException`, custom handlers, router prefixes, OpenAPI shapes, websockets, guards, DAG, Rust bridge, OAuth2/HTTP/API-key schemes, `Security`, password-grant forms, background tasks, datetime/UUID/Enum encoding.
+Coverage: ping, path/query/header/cookie params, validation shapes (422 `loc`/`type`/`ctx`, multi-error, malformed-JSON `json_invalid`), JSON body + `response_model` (+flags, return-annotation fallback), Form, file upload, DI order + `yield` teardown, `HTTPException`, custom handlers, router prefixes, OpenAPI shapes (full-spec equality, securitySchemes, webhooks), websockets (+auth), guards, DAG, Rust bridge, OAuth2/HTTP/API-key schemes, `Security`, password-grant forms, background tasks, datetime/UUID/Enum encoding, export surface, thread soak, Hyper host (file bytes, 413, middleware fallback, graceful lifespan, ws echo/auth).
 <!-- PARITY:END -->
 
 ## Rust core (Phase 2)
@@ -282,11 +282,11 @@ Micro fast-paths (in-process, no servers):
 
 | Check | Baseline | fasterapi | Speedup |
 |---|---|---|---|
-| JSON `loads` | 0.0451s stdlib | 0.0699s SIMD | x0.65 |
-| JSON `dumps` | stdlib | Rust bridge | x1.14 |
-| Model validate (`loads`+`validate_python` vs `validate_json`) | 0.0052s | 0.0023s | x2.26 |
-| Model dump (`dump_python`+`dumps` vs `dump_json`) | 0.0066s | 0.0022s | x3.0 |
-| Router match | 0.291s Python | 0.0916s `matchit` | x3.18 |
+| JSON `loads` | 0.0416s stdlib | 0.0674s SIMD | x0.62 |
+| JSON `dumps` | stdlib | Rust bridge | x1.15 |
+| Model validate (`loads`+`validate_python` vs `validate_json`) | 0.0051s | 0.0022s | x2.34 |
+| Model dump (`dump_python`+`dumps` vs `dump_json`) | 0.0063s | 0.0021s | x2.98 |
+| Router match | 0.2902s Python | 0.0892s `matchit` | x3.26 |
 
 Macro load (loopback, httpx concurrency; last full run):
 
