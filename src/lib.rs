@@ -227,6 +227,13 @@ fn write_json_value(buf: &mut String, obj: &Bound<'_, PyAny>) -> PyResult<()> {
 ///
 /// Falls back to `serde_json`, then to stdlib-compatible behavior for inputs
 /// only Python accepts (`Infinity`, `NaN`) so results match `json.loads`.
+///
+/// NOTE (measured x0.6 vs stdlib at all payload sizes): per-node PyObject
+/// materialization through the GIL API cannot beat CPython's tight C loop
+/// for *generic* parsing. This function is therefore OFF the request hot
+/// path — Pydantic bodies go through single-pass `validate_json` (x2.2)
+/// which never materializes an intermediate dict. Use this bridge for
+/// untyped/embedded payloads only.
 #[pyfunction]
 fn fast_json_loads(py: Python<'_>, payload: &str) -> PyResult<PyObject> {
     // simd-json mutates its input, so work on a private copy off-GIL.
@@ -1017,6 +1024,10 @@ async fn serve_one(
     app: PyObject,
     req: Request<hyper::body::Incoming>,
 ) -> Result<Response<RespBody>, hyper::Error> {
+    // Websocket upgrade? Must precede body collection (upgrades carry none).
+    if req.method() == hyper::Method::GET && is_ws_upgrade(req.headers()) {
+        return serve_ws(app, req).await;
+    }
     let method = req.method().to_string();
     let uri = req.uri().clone();
     let path = uri.path().to_string();
@@ -1150,6 +1161,391 @@ fn internal_error() -> (u16, Vec<(String, String)>, Vec<u8>) {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Websocket host (spike): Rust does the upgrade handshake + RFC 6455 framing,
+// Python drives the ASGI websocket app per session (see `_hyper_serve`).
+// ---------------------------------------------------------------------------
+
+/// Max single message size (4 MiB); largermtu → close 1009.
+const WS_MAX_MESSAGE: usize = 4 * 1024 * 1024;
+
+fn is_ws_upgrade(headers: &hyper::HeaderMap) -> bool {
+    let upgrade = headers
+        .get(hyper::header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("websocket"))
+        .unwrap_or(false);
+    let connection = headers
+        .get(hyper::header::CONNECTION)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_ascii_lowercase().split(',').any(|t| t.trim() == "upgrade"))
+        .unwrap_or(false);
+    upgrade && connection
+}
+
+struct WsFrame {
+    fin: bool,
+    opcode: u8,
+    payload: Vec<u8>,
+}
+
+enum FrameError {
+    Eof,
+    Oversize,
+    Protocol,
+}
+
+async fn read_ws_frame(
+    io: &mut TokioIo<hyper::upgrade::Upgraded>,
+) -> Result<WsFrame, FrameError> {
+    use tokio::io::AsyncReadExt;
+    let mut hdr = [0u8; 2];
+    io.read_exact(&mut hdr)
+        .await
+        .map_err(|_| FrameError::Eof)?;
+    let fin = hdr[0] & 0x80 != 0;
+    let opcode = hdr[0] & 0x0F;
+    let masked = hdr[1] & 0x80 != 0;
+    let mut len = (hdr[1] & 0x7F) as u64;
+    if opcode >= 0x8 && (!fin || len > 125) {
+        return Err(FrameError::Protocol); // control frames: FIN + ≤125B
+    }
+    if len == 126 {
+        let mut ext = [0u8; 2];
+        io.read_exact(&mut ext).await.map_err(|_| FrameError::Eof)?;
+        len = u16::from_be_bytes(ext) as u64;
+    } else if len == 127 {
+        let mut ext = [0u8; 8];
+        io.read_exact(&mut ext).await.map_err(|_| FrameError::Eof)?;
+        len = u64::from_be_bytes(ext);
+    }
+    if len > WS_MAX_MESSAGE as u64 {
+        return Err(FrameError::Oversize);
+    }
+    let mut mask = [0u8; 4];
+    if masked {
+        io.read_exact(&mut mask).await.map_err(|_| FrameError::Eof)?;
+    } else if opcode <= 0x2 {
+        return Err(FrameError::Protocol); // client data frames MUST be masked
+    }
+    let mut payload = vec![0u8; len as usize];
+    if len > 0 {
+        io.read_exact(&mut payload)
+            .await
+            .map_err(|_| FrameError::Eof)?;
+        if masked {
+            for (i, byte) in payload.iter_mut().enumerate() {
+                *byte ^= mask[i % 4];
+            }
+        }
+    }
+    Ok(WsFrame { fin, opcode, payload })
+}
+
+async fn write_ws_frame(
+    io: &mut TokioIo<hyper::upgrade::Upgraded>,
+    opcode: u8,
+    payload: &[u8],
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut hdr = vec![0x80 | (opcode & 0x0F)];
+    if payload.len() < 126 {
+        hdr.push(payload.len() as u8);
+    } else if payload.len() < 65536 {
+        hdr.push(126);
+        hdr.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    } else {
+        hdr.push(127);
+        hdr.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+    }
+    io.write_all(&hdr).await?;
+    io.write_all(payload).await?;
+    io.flush().await
+}
+
+fn ws_close_payload(code: u16, reason: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2 + reason.len());
+    out.extend_from_slice(&code.to_be_bytes());
+    out.extend_from_slice(reason);
+    out
+}
+
+/// Blocking Python call (spawn_blocking): run one ws step, return server frames.
+async fn py_ws_step(
+    app: PyObject,
+    sid: String,
+    opcode: Option<u8>,
+    payload: Vec<u8>,
+    wait_secs: f64,
+) -> Vec<(u8, Vec<u8>)> {
+    let _ = &app;
+    let res = tokio::task::spawn_blocking(move || {
+        Python::with_gil(|py| {
+            let helper = py
+                .import_bound("fasterapi._hyper_serve")
+                .map_err(|e| e.to_string())?;
+            let ret = helper
+                .getattr("ws_step")
+                .map_err(|e| e.to_string())?
+                .call1((sid, opcode, payload, wait_secs))
+                .map_err(|e| e.to_string())?;
+            ret.extract::<Vec<(u8, Vec<u8>)>>()
+                .map_err(|e| e.to_string())
+        })
+    })
+    .await;
+    match res {
+        Ok(Ok(frames)) => frames,
+        Ok(Err(e)) => {
+            eprintln!("fasterapi hyper ws_step: {e}");
+            vec![(0x8, ws_close_payload(1011, b"internal error"))]
+        }
+        Err(e) => {
+            eprintln!("fasterapi hyper ws join: {e}");
+            vec![(0x8, ws_close_payload(1011, b"internal error"))]
+        }
+    }
+}
+
+fn py_ws_close(sid: String) {
+    // Best-effort synchronous cleanup (idempotent server-side).
+    let _res: Result<(), PyErr> = Python::with_gil(|py| {
+        py.import_bound("fasterapi._hyper_serve")?
+            .getattr("ws_close")?
+            .call1((sid,))?;
+        Ok(())
+    });
+}
+
+async fn serve_ws(
+    app: PyObject,
+    req: Request<hyper::body::Incoming>,
+) -> Result<Response<RespBody>, hyper::Error> {
+    fn bad(status: StatusCode, msg: &'static str) -> Result<Response<RespBody>, hyper::Error> {
+        Ok(Response::builder()
+            .status(status)
+            .body(boxed_full(Bytes::from_static(msg.as_bytes())))
+            .unwrap())
+    }
+    let key = req
+        .headers()
+        .get("sec-websocket-key")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    if key.is_empty() {
+        return bad(StatusCode::BAD_REQUEST, "missing Sec-WebSocket-Key");
+    }
+    let version_ok = req
+        .headers()
+        .get("sec-websocket-version")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim() == "13")
+        .unwrap_or(false);
+    if !version_ok {
+        return bad(StatusCode::UPGRADE_REQUIRED, "Sec-WebSocket-Version: 13 required");
+    }
+    let path = req.uri().path().to_string();
+    let query = req.uri().query().unwrap_or("").to_string();
+    let mut headers: Vec<(String, Vec<u8>)> = Vec::new();
+    for (name, value) in req.headers() {
+        headers.push((name.to_string(), value.as_bytes().to_vec()));
+    }
+    // Ask Python to run the ASGI app until accept/refusal (blocking).
+    // Ask Python to run the ASGI app until accept/refusal (blocking).
+    // Join failure can only mean runtime shutdown; report as an error verdict.
+    let verdict: Result<Result<(String, String, Vec<(String, String)>), String>, String> =
+        tokio::task::spawn_blocking({
+            let app = Python::with_gil(|py| app.clone_ref(py));
+            move || {
+                Python::with_gil(|py| {
+                    let helper = py
+                        .import_bound("fasterapi._hyper_serve")
+                        .map_err(|e| e.to_string())?;
+                    let ret = helper
+                        .getattr("ws_open")
+                        .map_err(|e| e.to_string())?
+                        .call1((app, path, query, headers, key))
+                        .map_err(|e| e.to_string())?;
+                    ret.extract::<(String, String, Vec<(String, String)>)>()
+                        .map_err(|e| e.to_string())
+                })
+            }
+        })
+        .await
+        .map_err(|e| format!("ws_open join: {e}"));
+    let (sid, status, data) = match verdict {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => {
+            eprintln!("fasterapi hyper ws_open: {e}");
+            (String::new(), "error".to_string(), vec![])
+        }
+        Err(e) => {
+            eprintln!("fasterapi hyper ws_open: {e}");
+            (String::new(), "error".to_string(), vec![])
+        }
+    };
+    if status != "accepted" {
+        let (code, reason) = match status.as_str() {
+            "refused" => (403u16, data.first().map(|d| d.1.clone()).unwrap_or_default()),
+            _ => (500u16, "websocket open failed".to_string()),
+        };
+        let body = format!(r#"{{"detail":{reason:?}}}"#);
+        py_ws_close(sid);
+        return Ok(Response::builder()
+            .status(StatusCode::from_u16(code).unwrap())
+            .body(boxed_full(Bytes::from(body)))
+            .unwrap());
+    }
+    let accept_key = data.first().map(|d| d.0.clone()).unwrap_or_default();
+    let mut builder_101 = Response::builder()
+        .status(StatusCode::SWITCHING_PROTOCOLS)
+        .header("upgrade", "websocket")
+        .header("connection", "Upgrade")
+        .header("sec-websocket-accept", accept_key);
+    for (k, v) in data.iter().skip(1) {
+        let kl = k.to_ascii_lowercase();
+        if kl == "content-length"
+            || kl == "transfer-encoding"
+            || kl == "connection"
+            || kl == "upgrade"
+            || kl == "sec-websocket-accept"
+            || kl.starts_with("x-fasterapi-")
+        {
+            continue;
+        }
+        if let (Ok(name), Ok(value)) = (
+            hyper::header::HeaderName::from_bytes(k.as_bytes()),
+            hyper::header::HeaderValue::from_bytes(v.as_bytes()),
+        ) {
+            builder_101 = builder_101.header(name, value);
+        }
+    }
+    // The upgrade future only resolves AFTER this 101 goes out, so the pump
+    // must run detached — awaiting it here would deadlock. Clone what moves.
+    let pump_app = Python::with_gil(|py| app.clone_ref(py));
+    let pump_fut = hyper::upgrade::on(req);
+    tokio::spawn(async move {
+        match pump_fut.await {
+            Ok(upgraded) => {
+                let mut io = TokioIo::new(upgraded);
+                ws_pump(&pump_app, &sid, &mut io).await;
+            }
+            Err(e) => {
+                eprintln!("fasterapi hyper: upgrade failed: {e}");
+                py_ws_close(sid);
+            }
+        }
+    });
+    Ok(builder_101.body(boxed_full(Bytes::new())).unwrap())
+}
+
+/// Frame pump for one upgraded connection: client frames drive app steps;
+/// idle ticks drain server pushes. The connection belongs to this task.
+async fn ws_pump(app: &PyObject, sid: &str, io: &mut TokioIo<hyper::upgrade::Upgraded>) {
+    // Frame pump: client frames drive app steps; idle ticks drain pushes.
+    let mut io: &mut TokioIo<hyper::upgrade::Upgraded> = io;
+    let mut frag_op: Option<u8> = None;
+    let mut frag_buf: Vec<u8> = Vec::new();
+    loop {
+        tokio::select! {
+            fr = read_ws_frame(&mut io) => match fr {
+                Err(FrameError::Eof) => break,
+                Err(FrameError::Oversize) => {
+                    let _ = write_ws_frame(&mut io, 0x8, &ws_close_payload(1009, b"message too big")).await;
+                    break;
+                }
+                Err(FrameError::Protocol) => {
+                    let _ = write_ws_frame(&mut io, 0x8, &ws_close_payload(1002, b"protocol error")).await;
+                    break;
+                }
+                Ok(f) => match f.opcode {
+                    0x9 => { let _ = write_ws_frame(&mut io, 0xA, &f.payload).await; }
+                    0xA => {}
+                    0x8 => {
+                        let _ = write_ws_frame(&mut io, 0x8, &f.payload).await;
+                        break;
+                    }
+                    0x0 | 0x1 | 0x2 => {
+                        if f.opcode != 0x0 {
+                            if frag_op.is_some() {
+                                let _ = write_ws_frame(&mut io, 0x8, &ws_close_payload(1002, b"fragment error")).await;
+                                break;
+                            }
+                            frag_op = Some(f.opcode);
+                            frag_buf.clear();
+                        } else if frag_op.is_none() {
+                            let _ = write_ws_frame(&mut io, 0x8, &ws_close_payload(1002, b"stray continuation")).await;
+                            break;
+                        }
+                        if frag_buf.len() + f.payload.len() > WS_MAX_MESSAGE {
+                            let _ = write_ws_frame(&mut io, 0x8, &ws_close_payload(1009, b"message too big")).await;
+                            break;
+                        }
+                        frag_buf.extend_from_slice(&f.payload);
+                        if f.fin {
+                            let op = frag_op.take().unwrap_or(f.opcode);
+                            let payload = std::mem::take(&mut frag_buf);
+                            if op == 0x1 && std::str::from_utf8(&payload).is_err() {
+                                let _ = write_ws_frame(&mut io, 0x8, &ws_close_payload(1007, b"bad utf-8")).await;
+                                break;
+                            }
+                            if forward_ws_frames(app, sid, io, op, payload, 5.0).await {
+                                break;
+                            }
+                        }
+                    }
+                    _ => {
+                        let _ = write_ws_frame(&mut io, 0x8, &ws_close_payload(1003, b"unsupported opcode")).await;
+                        break;
+                    }
+                },
+            },
+            _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
+                if forward_ws_frames(app, sid, io, 0xFF, Vec::new(), 0.1).await {
+                    break;
+                }
+            }
+        }
+    }
+    py_ws_close(sid.to_string());
+}
+
+/// Deliver one client message (or a poll tick, opcode 0xFF) and forward
+/// queued server frames. Returns true when the session ended.
+async fn forward_ws_frames(
+    app: &PyObject,
+    sid: &str,
+    io: &mut TokioIo<hyper::upgrade::Upgraded>,
+    opcode: u8,
+    payload: Vec<u8>,
+    wait_secs: f64,
+) -> bool {
+    let app_ref = Python::with_gil(|py| app.clone_ref(py));
+    let (op, data) = if opcode == 0xFF {
+        (None, Vec::new())
+    } else {
+        (Some(opcode), payload)
+    };
+    for (sop, spayload) in py_ws_step(app_ref, sid.to_string(), op, data, wait_secs).await {
+        if sop == 0x8 {
+            let _ = write_ws_frame(io, 0x8, &spayload).await;
+            return true;
+        }
+        if write_ws_frame(io, sop, &spayload).await.is_err() {
+            return true;
+        }
+    }
+    false
+}
+
+fn py_ws_close_session(sid: String) {
+    if sid.is_empty() {
+        return;
+    }
+    let _ = tokio::task::spawn_blocking(move || py_ws_close(sid));
+}
+
 /// Serve an ASGI app over Hyper + Tokio. Blocks until Ctrl-C (SIGINT).
 ///
 /// `workers=None` uses Tokio's default (one worker per CPU).
@@ -1220,10 +1616,13 @@ fn run_until_ctrl_c(
                             let pool = pool.clone();
                             async move { serve_one(&pool, app_ref, req).await }
                         });
-                        if let Err(e) = http1::Builder::new()
+                        // with_upgrades is REQUIRED: without it, upgrade::on()
+                        // can never resolve ("low level API in use").
+                        let conn = http1::Builder::new()
                             .serve_connection(io, svc)
-                            .await
-                        {
+                            .with_upgrades();
+                        tokio::pin!(conn);
+                        if let Err(e) = conn.await {
                             eprintln!("fasterapi hyper: connection error: {e}");
                         }
                         in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);

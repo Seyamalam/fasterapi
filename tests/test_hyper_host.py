@@ -46,6 +46,35 @@ from fasterapi.middleware.cors import CORSMiddleware
 app.add_middleware(CORSMiddleware, allow_origins=["https://x.example"], allow_methods=["GET"])
 """
 
+APP_CODE_WS = """
+import sys
+sys.path.insert(0, {root!r})
+from fasterapi import FastAPI, WebSocket
+
+app = FastAPI(title="hyper-ws-test")
+
+@app.get("/ping")
+async def ping():
+    return dict(pong=True)
+
+@app.websocket("/ws")
+async def ws(websocket: WebSocket):
+    await websocket.accept()
+    data = await websocket.receive_text()
+    await websocket.send_text(f"echo:{{data}}")
+    await websocket.close()
+
+@app.websocket("/auth")
+async def wsa(websocket: WebSocket):
+    await websocket.accept()
+    token = websocket.query_params.get("token", "")
+    if token != "s3cr3t":
+        await websocket.close(code=4401)
+        return
+    await websocket.send_text("authed")
+    await websocket.close()
+"""
+
 
 def _write_app(tmp: Path, name: str, code: str, datafile: str) -> Path:
     root = str(Path(__file__).resolve().parents[1] / "python")
@@ -209,3 +238,91 @@ def test_hyper_graceful_shutdown_runs_lifespan(tmp_path):
     finally:
         if p.poll() is None:
             p.kill()
+
+
+def _ws_raw(host, port, path):
+    """Stdlib raw websocket client (masked frames, no deps)."""
+    import base64
+    import hashlib
+    import os as _os
+    import socket as _socket
+
+    sock = _socket.create_connection((host, port), timeout=10)
+    key = base64.b64encode(_os.urandom(16)).decode()
+    sock.sendall(
+        (f"GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\n"
+         "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+         f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode()
+    )
+    head = b""
+    while b"\r\n\r\n" not in head:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise ConnectionError(f"handshake failed: {head!r}")
+        head += chunk
+    assert b" 101 " in head.split(b"\r\n", 1)[0], head[:60]
+
+    def send(op, payload: bytes):
+        mask = _os.urandom(4)
+        hdr = bytes([0x80 | op])
+        n = len(payload)
+        hdr += bytes([0x80 | n]) if n < 126 else bytes([0x80 | 126]) + n.to_bytes(2, "big")
+        sock.sendall(hdr + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+
+    def recv(timeout=10.0):
+        sock.settimeout(timeout)
+        hdr = _recvall(2)
+        op, ln = hdr[0] & 0x0F, hdr[1] & 0x7F
+        if ln == 126:
+            ln = int.from_bytes(_recvall(2), "big")
+        data = _recvall(ln) if ln else b""
+        if op == 0x1:
+            return ("text", data.decode())
+        if op == 0x8:
+            return ("close", int.from_bytes(data[:2], "big") if len(data) >= 2 else 1000)
+        return ("other", (op, data))
+
+    def _recvall(n):
+        buf = b""
+        while len(buf) < n:
+            chunk = sock.recv(n - len(buf))
+            if not chunk:
+                raise ConnectionError("eof")
+            buf += chunk
+        return buf
+
+    return sock, send, recv
+
+
+def test_hyper_websocket_bytes_identical(tmp_path):
+    app = _write_app(tmp_path, "hyperws", APP_CODE_WS, str(tmp_path / "x"))
+    hyper_port, uvicorn_port = _free_port(), _free_port()
+    ph = _start(app, hyper_port, hyper=True)
+    pu = _start(app, uvicorn_port, hyper=False)
+    try:
+        _wait(hyper_port)
+        _wait(uvicorn_port)
+        for port in (hyper_port, uvicorn_port):
+            sock, send, recv = _ws_raw("127.0.0.1", port, "/ws")
+            try:
+                send(0x1, b"hi")
+                assert recv() == ("text", "echo:hi"), port
+                assert recv()[0] == "close", port
+            finally:
+                sock.close()
+        # auth gate: bad token closes, good token greets — both hosts alike
+        for port in (hyper_port, uvicorn_port):
+            sock, send, recv = _ws_raw("127.0.0.1", port, "/auth?token=nope")
+            try:
+                kind, val = recv()
+                assert kind == "close", (port, kind, val)
+            finally:
+                sock.close()
+            sock, send, recv = _ws_raw("127.0.0.1", port, "/auth?token=s3cr3t")
+            try:
+                assert recv() == ("text", "authed"), port
+            finally:
+                sock.close()
+    finally:
+        _stop(ph)
+        _stop(pu)

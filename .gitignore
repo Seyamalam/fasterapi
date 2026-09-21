@@ -21,8 +21,11 @@ Cargo.lock
 benchmark-results/
 *.prof
 examples/comparison/audit-results/
+examples/comparison/audit.db
 examples/comparison/audit_*.db
 examples/comparison/audit_*.db-*
+audit_fastapi.db*
+audit_fasterapi.db*
 
 # OS / editors
 .DS_Store

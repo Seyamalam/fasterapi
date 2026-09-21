@@ -44,6 +44,7 @@ test = [
   "uvicorn>=0.29",
   "httpx>=0.24",
   "python-multipart>=0.0.9",
+  "websockets>=14.0",
 ]
 bench = [
   "uvicorn>=0.29",
