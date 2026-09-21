@@ -62,6 +62,7 @@ class FastAPI(Starlette):
         swagger_ui_oauth2_redirect_url: Optional[str] = "/docs/oauth2-redirect",
         swagger_ui_parameters: Optional[dict[str, Any]] = None,
         servers: Optional[list[dict[str, Any]]] = None,
+        webhooks: Optional[Any] = None,
         **extra: Any,
     ) -> None:
         super().__init__(lifespan=lifespan, middleware=middleware)  # type: ignore[call-arg]
@@ -74,6 +75,10 @@ class FastAPI(Starlette):
         self.version = version
         self.description = description
         self.servers = servers
+        self.webhooks: Optional[list[Any]] = None
+        if webhooks is not None:
+            # Accept an APIRouter (FastAPI style) or a plain route list.
+            self.webhooks = list(getattr(webhooks, "routes", webhooks))
         self.docs_url = docs_url
         self.redoc_url = redoc_url
         self.openapi_url = openapi_url
@@ -255,6 +260,7 @@ class FastAPI(Starlette):
             description=self.description,
             routes=self._router.routes,
             servers=self.servers,
+            webhooks=self.webhooks,
         )
 
     # -- Phase-2: AOT build ------------------------------------------------------

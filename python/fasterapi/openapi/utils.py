@@ -189,6 +189,7 @@ def get_openapi(
     routes: list[Any],
     openapi_prefix: str = "",
     servers: Optional[list[dict[str, Any]]] = None,
+    webhooks: Optional[list[Any]] = None,
     **_extra: Any,
 ) -> dict[str, Any]:
     paths: dict[str, Any] = {}
@@ -213,6 +214,23 @@ def get_openapi(
         "info": {"title": title, "version": version},
         "paths": paths,
     }
+    if webhooks:
+        hooks: dict[str, Any] = {}
+        for route in webhooks:
+            if getattr(route, "endpoint", None) is None:
+                continue
+            rpath = getattr(route, "path", "/")
+            item = hooks.setdefault(rpath, {})
+            path_item, schemas, schemes = get_openapi_path(
+                route=route, operation_ids=operation_ids
+            )
+            item.update(path_item)
+            for key, value in schemas.items():
+                components.setdefault(key, value)
+            for key, value in schemes.items():
+                security_schemes.setdefault(key, value)
+        if hooks:
+            doc["webhooks"] = hooks
     if description:
         doc["info"]["description"] = description
     if servers:

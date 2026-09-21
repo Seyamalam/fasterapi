@@ -565,6 +565,23 @@ def test_openapi_security_and_servers():
     assert g.openapi() == f.openapi()
 
 
+def test_openapi_webhooks():
+    def build(cls):  # type: ignore[no-untyped-def]
+        from fasterapi import APIRouter as _FR
+        from fastapi import APIRouter as _GR
+        R = _GR if cls is GFastAPI else _FR
+        wh = R()
+
+        @wh.post("/new-pet")
+        def new_pet(item: Item):
+            return item
+
+        return cls(title="T", version="1", webhooks=wh)
+
+    assert build(GFastAPI).openapi() == build(F.FastAPI).openapi()
+    assert set(build(F.FastAPI).openapi()["webhooks"]) == {"/new-pet"}
+
+
 def test_websocket_echo_parity():
     g_app = GFastAPI()
 
