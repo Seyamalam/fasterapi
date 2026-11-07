@@ -16,11 +16,15 @@ from .exceptions import WebSocketRequestValidationError as WebSocketRequestValid
 from .utils import is_body_allowed_for_status_code as is_body_allowed_for_status_code  # noqa: F401
 
 
-async def http_exception_handler(request: Request, exc: Any) -> JSONResponse:  # type: ignore[no-untyped-def]
+async def http_exception_handler(request: Request, exc: Any) -> Response:  # type: ignore[no-untyped-def]
+    status_code = getattr(exc, "status_code", 500)
+    headers = getattr(exc, "headers", None)
+    if not is_body_allowed_for_status_code(status_code):
+        return Response(status_code=status_code, headers=headers)
     return JSONResponse(
         {"detail": getattr(exc, "detail", str(exc))},
-        status_code=getattr(exc, "status_code", 500),
-        headers=getattr(exc, "headers", None),
+        status_code=status_code,
+        headers=headers,
     )
 
 

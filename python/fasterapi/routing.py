@@ -317,7 +317,11 @@ def _validate_value(loc: list[str], raw: Any, annotation: Any, meta: Optional[Pa
                     pass
                 else:
                     err = _check_constraints("", loc, value, meta)
-                    return (value, None) if err is None else (None, err)
+                    if err is None:
+                        return value, None
+                    # Preserve the original wire value in Pydantic-style errors.
+                    err["input"] = raw
+                    return None, err
             msg = str(exc)
             # Strip Rust `ValueError: ` prefix if present.
             if ": " in msg and msg.split(": ", 1)[0].endswith("Error"):
@@ -1026,8 +1030,10 @@ def _make_http_handler(route: _RouteDef, router_deps: list[Depends]) -> Callable
             try:
                 body_json = _parsed_json_cached(request, body_raw)
             except _InvalidJson:
-                await JSONResponse({"detail": _json_invalid_error(body_raw)}, status_code=422)(scope, receive, send)
-                return
+                raise RequestValidationError(
+                    _json_invalid_error(body_raw),
+                    body=body_raw.decode("utf-8", "replace"),
+                )
         async with AsyncExitStack() as stack:
             cache: dict[int, Any] = {}
             try:

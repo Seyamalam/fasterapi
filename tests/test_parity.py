@@ -484,6 +484,10 @@ def test_custom_http_and_validation_exception_handlers():
         async def validate(value: int):
             return {"value": value}
 
+        @app.post("/malformed")
+        async def malformed(payload: dict):
+            return payload
+
         return app
 
     def build_fasterapi():
@@ -506,6 +510,10 @@ def test_custom_http_and_validation_exception_handlers():
         async def validate(value: int):
             return {"value": value}
 
+        @app.post("/malformed")
+        async def malformed(payload: dict):
+            return payload
+
         return app
 
     with GTestClient(build_fastapi()) as gc, F.TestClient(build_fasterapi()) as fc:
@@ -514,6 +522,9 @@ def test_custom_http_and_validation_exception_handlers():
             assert (a.status_code, a.json()) == (b.status_code, b.json())
             if path == "/error":
                 assert a.headers["x-error"] == b.headers["x-error"] == "custom"
+        a = gc.post("/malformed", content=b"{")
+        b = fc.post("/malformed", content=b"{")
+        assert (a.status_code, a.json()) == (b.status_code, b.json()) == (400, {"invalid": True})
 
 
 def test_router_prefix_parity(fastapi_client, fasterapi_client):

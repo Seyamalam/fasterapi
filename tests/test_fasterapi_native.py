@@ -125,10 +125,19 @@ def test_unbounded_integer_query_matches_python_int_range():
     async def integer(value: int):
         return {"value": value}
 
+    @app.get("/bounded")
+    async def bounded(value: int = Query(ge=5)):
+        return {"value": value}
+
     with _client(app) as client:
         response = client.get("/integer?value=9223372036854775808")
+        small_error = client.get("/bounded?value=3")
+        large_error = client.get("/bounded?value=9223372036854775808")
     assert response.status_code == 200
     assert response.json() == {"value": 9223372036854775808}
+    assert small_error.status_code == large_error.status_code == 422
+    assert small_error.json()["detail"][0]["input"] == "3"
+    assert large_error.json()["detail"][0]["input"] == "9223372036854775808"
 
 
 def test_hyper_direct_dispatch_uses_registered_exception_handlers():
@@ -145,6 +154,7 @@ def test_hyper_direct_dispatch_uses_registered_exception_handlers():
     async def error():
         raise ValueError("hyper path")
 
+    assert _hyper_serve._direct_ok(app)
     status, headers, body = _hyper_serve.run_request(
         app,
         "GET",
@@ -156,3 +166,39 @@ def test_hyper_direct_dispatch_uses_registered_exception_handlers():
     assert status == 418
     assert b"application/json" in dict(headers)["content-type"].encode().lower()
     assert body == b'{"handled":"hyper path"}'
+
+
+def test_hyper_direct_dispatch_uses_server_error_handler():
+    from fasterapi import _hyper_serve
+    from fasterapi.responses import JSONResponse
+
+    app = FastAPI()
+
+    @app.exception_handler(500)
+    async def internal_error_handler(request, exc):
+        return JSONResponse({"handled": "server error"}, status_code=500)
+
+    @app.get("/error")
+    async def error():
+        raise RuntimeError("server error")
+
+    assert _hyper_serve._direct_ok(app)
+    status, _headers, body = _hyper_serve.run_request(
+        app, "GET", "/error", "", [("host", b"localhost")], b""
+    )
+    assert status == 500
+    assert body == b'{"handled":"server error"}'
+
+
+def test_http_exception_no_body_statuses():
+    app = FastAPI()
+
+    @app.get("/no-content")
+    async def no_content():
+        raise HTTPException(status_code=204, detail="ignored", headers={"x-test": "yes"})
+
+    with _client(app) as client:
+        response = client.get("/no-content")
+    assert response.status_code == 204
+    assert response.content == b""
+    assert response.headers["x-test"] == "yes"

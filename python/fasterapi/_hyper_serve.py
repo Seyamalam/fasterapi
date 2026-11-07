@@ -42,7 +42,16 @@ def _direct_ok(app: Any) -> bool:
         from .middleware.asyncexitstack import AsyncExitStackMiddleware
 
         middlewares = getattr(app, "user_middleware", None) or []
-        return all(entry[0] is AsyncExitStackMiddleware for entry in middlewares)
+        for entry in middlewares:
+            cls = getattr(entry, "cls", None)
+            if cls is None:
+                try:
+                    cls = entry[0]
+                except (IndexError, KeyError, TypeError):
+                    return False
+            if cls is not AsyncExitStackMiddleware:
+                return False
+        return True
     except Exception:
         return False
 
@@ -162,6 +171,14 @@ def run_request(
                         {key: value for key, value in handlers.items() if isinstance(key, int)},
                     )
                     wrapped = wrap_app_handling_exceptions(route.app, Request(scope, receive, send))
+                    from starlette.middleware.errors import ServerErrorMiddleware
+
+                    server_error_handler = handlers.get(500) or handlers.get(Exception)
+                    wrapped = ServerErrorMiddleware(
+                        wrapped,
+                        handler=server_error_handler,
+                        debug=bool(getattr(app, "debug", False)),
+                    )
                     await wrapped(scope, receive, send)
                     return
         await app(scope, receive, send)
@@ -169,8 +186,14 @@ def run_request(
     try:
         _get_loop().run_until_complete(_go())
     except Exception:
+        if "status" not in sent:
+            traceback.print_exc()
+            raise
+        # Starlette's ServerErrorMiddleware sends its response and then
+        # re-raises so servers can log the exception. This bridge returns the
+        # already-sent response to Hyper rather than replacing it with its own
+        # generic 500 payload.
         traceback.print_exc()
-        raise
     return sent.get("status", 500), sent.get("headers", []), b"".join(sent.get("chunks", []))
 
 
