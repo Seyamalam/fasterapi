@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "fasterapi"
 version = "0.1.0"
-description = "1:1 FastAPI drop-in replacement with a native Rust (PyO3) core — radix routing, SIMD JSON, type-safe validators, edge guards"
+description = "FastAPI-compatible ASGI framework with native Rust (PyO3) components"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
@@ -36,6 +36,7 @@ dependencies = [
 standard = [
   "uvicorn>=0.29",
   "httpx>=0.24",
+  "jinja2>=3.1",
 ]
 test = [
   "pytest>=8.0",
@@ -45,6 +46,7 @@ test = [
   "httpx>=0.24",
   "python-multipart>=0.0.9",
   "websockets>=14.0",
+  "jinja2>=3.1",
 ]
 bench = [
   "uvicorn>=0.29",

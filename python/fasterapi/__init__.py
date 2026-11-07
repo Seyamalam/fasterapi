@@ -1,4 +1,4 @@
-"""fasterapi — 1:1 FastAPI drop-in with a native Rust (PyO3) core.
+"""fasterapi — FastAPI-compatible ASGI framework with a native Rust core.
 
 Drop-in migration is one import change::
 

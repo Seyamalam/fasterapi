@@ -1,28 +1,30 @@
 # fasterapi ⚡
 
-**1:1 FastAPI drop-in replacement, Rust-powered.**
+**FastAPI-compatible, Rust-powered.**
 
 ```python
 # from fastapi import FastAPI, Depends, HTTPException, Query, Path, Body, APIRouter  # before
 from fasterapi import FastAPI, Depends, HTTPException, Query, Path, Body, APIRouter  # after
 ```
 
-`fasterapi` keeps the exact FastAPI interface — decorators, `Path/Query/Header/Cookie/Body/Form`,
-Pydantic v2 validation, `Depends()` DI (sub-deps, `use_cache`, `yield` teardown),
-`HTTPException`/`RequestValidationError`, `@app.exception_handler`, lifespan, middleware,
-CORS, `TestClient`, OpenAPI — while the hot path moves to a native
-**Rust (PyO3)** core: radix routing (`matchit`), SIMD JSON
-(`simd-json`), strict scalar validators, token-bucket edge guards (`governor`), and an AOT-compiled
-`Depends()` DAG. Targets **Python 3.13+ free-threaded (`--disable-gil`)**;
-verified on 3.10–3.14.
+`fasterapi` aims for FastAPI API and behavior compatibility: decorators,
+`Path/Query/Header/Cookie/Body/Form`, Pydantic v2 validation, `Depends()` DI,
+exception handlers, lifespan, middleware, `TestClient`, and OpenAPI. See the
+migration guide for unsupported areas. Python/Starlette currently handles
+request orchestration; native Rust components accelerate selected primitives:
+`matchit` routing, JSON, scalar validation, token-bucket rate limiting, and a
+compiled dependency-graph representation. Targets Python ≥3.10. Free-threaded
+builds remain experimental pending a compatible PyO3 configuration and
+dedicated GIL-off validation.
 
-> Can it be done? **Yes — incrementally.** v0.1 lands total parity on the
-> battle-tested Starlette host (same engine FastAPI uses) with the Rust
-> data-plane already compiled in (`RustRouter`, SIMD JSON, validators,
-> `TokenBucket`, `DependencyDAG`). The inverted-runtime Hyper host (Rust owns
-> the socket, Python as embedded guest) is staged — its Tokio/Hyper stack is
-> deliberately *not* a dependency until it lands — and promotes once loopback
-> numbers beat uvicorn. No magic, all gates run locally.
+> Can it be done? **Yes — incrementally.** v0.1 targets broad parity on the
+> battle-tested Starlette host (same engine FastAPI uses) with Rust
+> primitives available (`RustRouter`, JSON helpers, validators, `TokenBucket`,
+> `DependencyDAG`). An opt-in Hyper host is also implemented for HTTP/1.1 and
+> WebSockets, but remains experimental: it buffers requests and responses,
+> has a 16 MiB request cap, and has not shown a consistent throughput win over
+> uvicorn. The default serving path remains uvicorn until performance and
+> compatibility gates justify promotion.
 
 ---
 
@@ -129,13 +131,13 @@ pytest tests/ -q
 
 | Suite | Tests | Result |
 |---|---|---|
-| Differential (`tests/test_parity.py`, FastAPI vs fasterapi) | 25 | all passing |
-| Native (`tests/test_fasterapi_native.py`) | 6 | all passing |
+| Differential (`tests/test_parity.py`, FastAPI vs fasterapi) | 26 | all passing |
+| Native (`tests/test_fasterapi_native.py`) | 11 | all passing |
 | Auth/background/encoders (`tests/test_parity_security.py`) | 8 | all passing |
 | SSE/docs-adjacent (`tests/test_parity_surface.py`) | 7 | all passing |
 | Export guard (`tests/test_exports.py`) | 3 | all passing |
 | Thread soak (`tests/test_threads.py`) | 3 | all passing |
-| **Total** | **52** | **58 passed** |
+| **Total** | **58** | **64 passed** |
 
 Coverage: ping, path/query/header/cookie params, validation shapes (422 `loc`/`type`/`ctx`, multi-error, malformed-JSON `json_invalid`), JSON body + `response_model` (+flags, return-annotation fallback), Form, file upload, DI order + `yield` teardown, `HTTPException`, custom handlers, router prefixes, OpenAPI shapes (full-spec equality, securitySchemes, webhooks), websockets (+auth), guards, DAG, Rust bridge, OAuth2/HTTP/API-key schemes, `Security`, password-grant forms, background tasks, datetime/UUID/Enum encoding, export surface, thread soak, Hyper host (file bytes, 413, middleware fallback, graceful lifespan, ws echo/auth).
 <!-- PARITY:END -->
@@ -144,16 +146,19 @@ Coverage: ping, path/query/header/cookie params, validation shapes (422 `loc`/`t
 
 `src/lib.rs` → `fasterapi._fasterapi_rs` (PyO3):
 
-- **`RustRouter`** — `matchit` radix tree; `app.build()` compiles every route
-  once; lookups run under a read-lock with the GIL released.
+- **`RustRouter`** — `matchit` radix tree; `app.build()` compiles route
+  patterns into this native primitive. Current request dispatch is still done
+  by Starlette; the native router is not yet the application request path.
 - **`fast_json_loads/dumps`** — `simd-json` + `serde_json`, `py.allow_threads`
   so worker threads never block on the GIL.
 - **`validate_int/float/bool/str`** — strict scalar coercion + constraints
   (`ge/le/gt/lt`, lengths, regex) for query/path/header/form, zero-GIL.
-- **`TokenBucket`** — `governor` token bucket; `RateLimiter` middleware
-  returns `429` without touching Python.
+- **`TokenBucket`** — thread-safe `governor` token bucket. The current
+  `RateLimiter` invokes it from Python middleware; rejection is not yet a
+  socket-level path that avoids Python.
 - **`DependencyDAG`** — `topological_sort()` + `concurrent_levels()` (Kahn)
-  so the host can fan out each level before the endpoint.
+  expose a compiled plan. Runtime dependency solving remains in Python and is
+  currently sequential; the levels are not yet used to fan out dependencies.
 - **Host helpers** — `hyper_health()`, `tokio_worker_count()`,
   `process_rss_bytes()`, `serve_static_config()` (sendfile plan).
 
@@ -163,20 +168,24 @@ from fasterapi import _rust_bridge as b
 b.fast_json_loads('{"a":1}')   # SIMD when compiled
 ```
 
-Full inverted runtime (Hyper owns the socket, no ASGI dicts, C-struct bridge)
-is staged — the Tokio/Hyper stack stays out of `Cargo.toml` until it lands —
-and `serve()` keeps uvicorn until loopback numbers promote it. See `src/lib.rs` header.
+The experimental inverted runtime is available through `FASTERAPI_HYPER=1`
+(or `fasterapi run --hyper`). Hyper owns the socket and HTTP parsing, but each
+request still crosses into Python through the ASGI bridge. The opt-in host is
+not the default: it buffers each response, caps request bodies at 16 MiB, and
+its measured loopback throughput has varied and can be below uvicorn. Keep
+uvicorn as the production default unless your own workload tests support the
+Hyper host.
 
 ## Modern Python (Phase 3)
 
 - **PEP 695 generics** — plain `async def h[T: BaseModel](payload: T)` works;
   validation goes through `TypeAdapter(T)` like any model.
-- **Edge guards** — `app.add_middleware(RateLimiter, per_second=500)` and
-  `app.add_middleware(APIKeyGuard, api_key="…")` execute in Rust when compiled
-  (`401`/`429` with ~0 Python overhead).
-- **Zero-copy files** — `from fasterapi import FileResponse` records a static
-  serve plan (`x-fasterapi-serve`); the staged host will `sendfile` media
-  bypassing Python.
+- **Edge guards** — `RateLimiter` uses the native token-bucket primitive when
+  compiled, but middleware dispatch itself remains in Python. `APIKeyGuard`
+  is a Python middleware.
+- **File serving** — under the opt-in Hyper host, `FileResponse` can attach an
+  internal sendfile marker for whole-file responses. Range requests and
+  uvicorn use Starlette's Python file-response path.
 
 ## Testing & benchmarking (Phase 4)
 
@@ -251,12 +260,12 @@ fasterapi/
 
 ## Free-threading
 
-All Rust entry points use `py.allow_threads` + `parking_lot` locks; the Python
-DI solver keeps per-request state in locals (no shared mutables), so
-`PYTHON_GIL=0` / `python -X gil=0` (3.13t/3.14t) runs handlers concurrently in
-one address space. The default build here targets stable ABI; for a
-free-threaded interpreter rebuild with `Py_GIL_DISABLED=1` and
-`maturin develop --release`.
+Several Rust parsing and validation routines release the GIL with
+`py.allow_threads`; shared native router state is protected by locks. Python
+request state is local, and shared reflection/adapter caches use locks. This
+is not, by itself, proof of full free-threaded compatibility: the extension
+must be built with a compatible PyO3/free-threaded configuration and tested on
+a `--disable-gil` interpreter before that runtime can be considered supported.
 
 ## Benchmarks
 
@@ -264,16 +273,13 @@ Numbers below are regenerated on every commit (`scripts/update_readme_tables.py`
 via pre-commit; macro rows reflect the last full bench run on the committer's
 machine, so hardware cancels out in the gate).
 
-Reading the macro rows on GIL CPython: the Hyper host wins IO fan-out
-(higher RPS, far better p90/p99 under concurrency) while validation-heavy
-handlers hit GIL physics — the same Python work through more threads
-contends where uvicorn's single loop doesn't (single-run loopback numbers
-swing ±15%, so the gate uses a wide x0.80 band and a strict micro 3x).
-Tune the host with `FASTERAPI_POOL` (Python worker threads; fewer wins on
-GIL builds for CPU-heavy handlers, more hides IO latency; default is CPU
-count). Handler stages we own (model validation/dump, routing) are 2–3x
-regardless; free-threaded (`--disable-gil`) builds remove the GIL ceiling
-for the host too.
+The recorded macro row is a single historical loopback run and shows the
+Hyper host below uvicorn; treat it as indicative rather than definitive,
+since local loopback measurements vary substantially. Validation-heavy
+handlers also remain Python-bound, so moving socket parsing to Rust does not
+remove Python/Pydantic or GIL costs. Re-run the differential benchmark on the
+target workload before choosing a host. The Hyper host's Python worker pool is
+configurable with `FASTERAPI_POOL`; its default is the CPU count.
 
 <!-- BENCH:START -->
 > Auto-generated by `scripts/update_readme_tables.py` — do not edit by hand. Engine: `Rust ext`.
@@ -282,34 +288,27 @@ Micro fast-paths (in-process, no servers):
 
 | Check | Baseline | fasterapi | Speedup |
 |---|---|---|---|
-| JSON `loads` | 0.0416s stdlib | 0.0674s SIMD | x0.62 |
-| JSON `dumps` | stdlib | Rust bridge | x1.15 |
-| Model validate (`loads`+`validate_python` vs `validate_json`) | 0.0051s | 0.0022s | x2.34 |
-| Model dump (`dump_python`+`dumps` vs `dump_json`) | 0.0063s | 0.0021s | x2.98 |
-| Router match | 0.2902s Python | 0.0892s `matchit` | x3.26 |
+| JSON `loads` | 0.0222s stdlib | 0.0377s SIMD | x0.59 |
+| JSON `dumps` | stdlib | Rust bridge | x0.95 |
+| Model validate (`loads`+`validate_python` vs `validate_json`) | 0.0024s | 0.0013s | x1.89 |
+| Model dump (`dump_python`+`dumps` vs `dump_json`) | 0.0032s | 0.0012s | x2.71 |
+| Router match | 0.1917s Python | 0.0603s `matchit` | x3.18 |
 
 Macro load (loopback, httpx concurrency; last full run):
 
-Run: `2026-09-18`, host `hyper`, speedup **x0.914** (pre-push: micro strict 3x + macro wide band x0.80).
-
-| Server | RPS | p50 | p90 | p99 | RSS |
-|---|---|---|---|---|---|
-| fastapi+uvicorn | 751.3 | 46.753ms | 138.089ms | 280.445ms | 53.3MB |
-| fasterapi | 686.8 | 46.883ms | 155.702ms | 309.548ms | 62.9MB |
-
-POST /items (Pydantic validation path): fastapi+uvicorn 648.2 RPS vs fasterapi 591.2 RPS → **x0.912**.
-POST /bulk x50 (validation-heavy): fastapi+uvicorn 636.5 RPS vs fasterapi 570.1 RPS → **x0.896**.
+No full run yet — `python benchmarks/benchmark_differential.py --quick` writes `benchmark-results/differential-latest.json`, then re-run this script.
 <!-- BENCH:END -->
 
 Design rule going forward: **as much as possible in Rust,
-type-safe, lighter** — routing, query parsing, scalar validation, JSON,
-rate-limiting and static files live in `src/lib.rs` (strict types,
-`allow_threads`, no shared mutables); Python keeps only FastAPI-compatible
-orchestration (DI graph shape, Pydantic model validation, handler dispatch)
-until the Hyper host promotes. `HAS_RUST` + `--micro-only` prove each step.
+type-safe, lighter**. Rust primitives are available for routing, query parsing,
+scalar validation, JSON, rate limiting, and Hyper file serving; current ASGI
+dispatch and dependency resolution still have Python/Starlette work. Measure
+each integration end to end rather than inferring request performance from
+isolated microbenchmarks. `HAS_RUST` + `--micro-only` check extension
+availability and primitive behavior, not end-to-end speed.
 
-Set `FASTERAPI_MIN_SPEEDUP=3.0` once the extension is compiled to enforce the
-3x routing fast-path gate from the spec.
+`FASTERAPI_MIN_SPEEDUP=3.0` enables the strict microbenchmark gate for the
+native router primitive; this is not an end-to-end request dispatch gate.
 
 ## Roadmap
 
@@ -317,7 +316,7 @@ Set `FASTERAPI_MIN_SPEEDUP=3.0` once the extension is compiled to enforce the
 - [x] Phase 2 — Rust DAG/router/SIMD JSON/guards primitives + `app.build()`
 - [x] Phase 3 — PEP 695, edge guards, sendfile `FileResponse`
 - [x] Phase 4 — differential tests + benchmark engine + pre-push gate
-- [ ] Promote Hyper inverted host (add back Tokio/Hyper deps, `FASTERAPI_HYPER=1` default) + `sendfile` static mount
+- [ ] Evaluate whether Hyper can meet production compatibility and end-to-end performance gates before considering default promotion
 - [ ] Fan-out of `concurrent_levels()` for async deps (sequential `await` today)
 - [ ] `3.13t` wheel CI (local maturin only — no Actions per repo policy)
 

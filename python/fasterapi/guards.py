@@ -8,6 +8,7 @@ before any handler runs.
 
 from __future__ import annotations
 
+import hmac
 from typing import Any, Awaitable, Callable, Optional
 
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
@@ -65,12 +66,7 @@ class APIKeyGuard(BaseHTTPMiddleware):
 
 
 def _constant_time_eq(a: str, b: str) -> bool:
-    if len(a) != len(b):
-        return False
-    result = 0
-    for x, y in zip(a.encode(), b.encode()):
-        result |= x ^ y
-    return result == 0
+    return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
 
 
 # Functional guard helper for route-level `dependencies=[Depends(api_key_guard)]`
@@ -84,7 +80,7 @@ def api_key_dependency(expected: str) -> Callable[..., Awaitable[None]]:
             auth = request.headers.get("authorization", "")
             if auth.lower().startswith("bearer "):
                 provided = auth[7:].strip()
-        if provided != expected:
+        if provided is None or not _constant_time_eq(provided, expected):
             raise HTTPException(status_code=401, detail="Unauthorized")
 
     return _guard

@@ -1159,7 +1159,7 @@ def _sse_response(gen: Any, status_code: int) -> StreamingResponse:
 # ---------------------------------------------------------------- router ---
 
 class APIRouter:
-    """Drop-in ``fastapi.APIRouter``."""
+    """FastAPI-compatible router for request and dependency declarations."""
 
     def __init__(
         self,

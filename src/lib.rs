@@ -14,13 +14,15 @@
 //!   * Host helpers (`hyper_health`, `tokio_worker_count`, `process_rss_bytes`,
 //!     `serve_static_config`).
 //!
-//! The inverted-runtime Hyper + Tokio host (Rust owns the socket, Python runs
-//! as an embedded guest) is staged, not shipped: its stack (tokio, hyper,
-//! hyper-util) is deliberately absent from Cargo.toml until it lands, keeping
-//! the build light. Parity stays king until then — Starlette host + Pydantic.
+//! The opt-in Hyper + Tokio host is implemented as an experimental HTTP/1.1
+//! server. Rust owns sockets and framing, while Python still runs the ASGI app
+//! through a bridge; request/response buffering, Python dispatch, and protocol
+//! compatibility remain constraints. Uvicorn stays the default host.
 //!
-//! Threading: every entry point is pure + lock-clean (`parking_lot`), safe for
-//! Python 3.13+ free-threaded (`--disable-gil`) runtimes.
+//! Threading: shared native router state uses `parking_lot`; pure parsing
+//! helpers release the GIL where practical. This does not establish support
+//! for free-threaded Python; that requires a compatible PyO3 build and GIL-off
+//! validation of the whole extension and Python integration.
 
 use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroU32;
@@ -28,6 +30,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use parking_lot::RwLock;
+use pyo3::conversion::IntoPyObject;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString};
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -39,34 +42,40 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 fn value_to_py(py: Python<'_>, v: &serde_json::Value) -> PyObject {
     match v {
         serde_json::Value::Null => py.None(),
-        serde_json::Value::Bool(b) => PyBool::new_bound(py, *b).to_object(py),
+        serde_json::Value::Bool(b) => PyBool::new(py, *b).to_owned().into_any().unbind(),
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
-                i.to_object(py)
+                i.into_pyobject(py)
+                    .expect("i64 conversion cannot fail")
+                    .into_any()
+                    .unbind()
             } else if let Some(u) = n.as_u64() {
-                u.to_object(py)
+                u.into_pyobject(py)
+                    .expect("u64 conversion cannot fail")
+                    .into_any()
+                    .unbind()
             } else if let Some(f) = n.as_f64() {
-                PyFloat::new_bound(py, f).to_object(py)
+                PyFloat::new(py, f).into_any().unbind()
             } else {
                 py.None()
             }
         }
-        serde_json::Value::String(s) => PyString::new_bound(py, s).to_object(py),
+        serde_json::Value::String(s) => PyString::new(py, s).into_any().unbind(),
         serde_json::Value::Array(arr) => {
-            let list = PyList::empty_bound(py);
+            let list = PyList::empty(py);
             for item in arr {
                 list.append(value_to_py(py, item))
                     .expect("list append cannot fail");
             }
-            list.to_object(py)
+            list.into_any().unbind()
         }
         serde_json::Value::Object(map) => {
-            let dict = PyDict::new_bound(py);
+            let dict = PyDict::new(py);
             for (k, val) in map {
                 dict.set_item(k, value_to_py(py, val))
                     .expect("dict insert cannot fail");
             }
-            dict.to_object(py)
+            dict.into_any().unbind()
         }
     }
 }
@@ -237,21 +246,23 @@ fn write_json_value(buf: &mut String, obj: &Bound<'_, PyAny>) -> PyResult<()> {
 #[pyfunction]
 fn fast_json_loads(py: Python<'_>, payload: &str) -> PyResult<PyObject> {
     // simd-json mutates its input, so work on a private copy off-GIL.
-    let parsed: Result<serde_json::Value, String> = py
-        .allow_threads(|| {
-            let mut bytes = payload.as_bytes().to_vec();
-            simd_json::from_slice::<serde_json::Value>(&mut bytes)
-                .or_else(|_| serde_json::from_str::<serde_json::Value>(payload))
-                .map_err(|e| e.to_string())
-        });
+    let parsed: Result<serde_json::Value, String> = py.allow_threads(|| {
+        let mut bytes = payload.as_bytes().to_vec();
+        simd_json::from_slice::<serde_json::Value>(&mut bytes)
+            .or_else(|_| serde_json::from_str::<serde_json::Value>(payload))
+            .map_err(|e| e.to_string())
+    });
     match parsed {
         Ok(value) => Ok(value_to_py(py, &value)),
         Err(_) => {
             // Slow path (invalid/edge input only): delegate to stdlib for
             // exact messages, positions and Infinity/NaN acceptance.
-            let json_mod = py.import_bound("json")?;
+            let json_mod = py.import("json")?;
             let loads = json_mod.getattr("loads")?;
-            loads.call1((payload,))?.extract()
+            Ok(loads
+                .call1((payload,))?
+                .extract::<Bound<'_, PyAny>>()?
+                .unbind())
         }
     }
 }
@@ -368,11 +379,11 @@ impl RustRouter {
         match found {
             None => Ok(None),
             Some((target, params)) => {
-                let dict = PyDict::new_bound(py);
+                let dict = PyDict::new(py);
                 for (k, v) in params {
                     dict.set_item(k, v)?;
                 }
-                Ok(Some((target, dict.to_object(py))))
+                Ok(Some((target, dict.into_any().unbind())))
             }
         }
     }
@@ -890,10 +901,8 @@ use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 
 /// Boxed response body: buffered (`Full`) or file-streamed (`StreamBody`).
-type RespBody = http_body_util::combinators::BoxBody<
-    Bytes,
-    Box<dyn std::error::Error + Send + Sync>,
->;
+type RespBody =
+    http_body_util::combinators::BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
 
 fn boxed_full(bytes: Bytes) -> RespBody {
     Full::new(bytes)
@@ -930,11 +939,11 @@ fn run_py_job(job: PyJob) {
         let py_headers: Vec<(String, PyObject)> = job
             .headers
             .iter()
-            .map(|(k, v)| (k.clone(), PyBytes::new_bound(py, v).into_any().unbind()))
+            .map(|(k, v)| (k.clone(), PyBytes::new(py, v).into_any().unbind()))
             .collect();
-        let py_body = PyBytes::new_bound(py, &job.body).into_any().unbind();
+        let py_body = PyBytes::new(py, &job.body).into_any().unbind();
         let helper = py
-            .import_bound("fasterapi._hyper_serve")
+            .import("fasterapi._hyper_serve")
             .map_err(|e| e.to_string())?;
         let ret = helper
             .getattr("run_request")
@@ -988,16 +997,11 @@ impl PyWorkerPool {
     }
 
     fn dispatch(&self, job: PyJob) -> Result<(), PyJob> {
-        let i = self
-            .next
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            % self.senders.len();
-        self.senders[i]
-            .try_send(job)
-            .map_err(|e| match e {
-                std::sync::mpsc::TrySendError::Full(job) => job,
-                std::sync::mpsc::TrySendError::Disconnected(job) => job,
-            })
+        let i = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.senders.len();
+        self.senders[i].try_send(job).map_err(|e| match e {
+            std::sync::mpsc::TrySendError::Full(job) => job,
+            std::sync::mpsc::TrySendError::Disconnected(job) => job,
+        })
     }
 }
 
@@ -1007,7 +1011,7 @@ fn run_lifespan(app: &PyObject, kind: &str) -> Result<(), String> {
     tokio::task::block_in_place(|| {
         Python::with_gil(|py| {
             let helper = py
-                .import_bound("fasterapi._hyper_serve")
+                .import("fasterapi._hyper_serve")
                 .map_err(|e| e.to_string())?;
             helper
                 .getattr("run_lifespan")
@@ -1091,9 +1095,8 @@ async fn serve_one(
             internal_error()
         }
     };
-    let mut builder = Response::builder().status(
-        StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-    );
+    let mut builder = Response::builder()
+        .status(StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR));
     let sendfile_path: Option<String> = resp_headers
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case("x-fasterapi-sendfile"))
@@ -1131,13 +1134,11 @@ async fn serve_one(
                 }
                 use futures_util::TryStreamExt;
                 use http_body_util::BodyExt as _BodyExt;
-                let stream = tokio_util::io::ReaderStream::new(file)
-                    .map_ok(hyper::body::Frame::data);
+                let stream =
+                    tokio_util::io::ReaderStream::new(file).map_ok(hyper::body::Frame::data);
                 let body = _BodyExt::map_err(
                     http_body_util::StreamBody::new(stream),
-                    |e: std::io::Error| -> Box<dyn std::error::Error + Send + Sync> {
-                        Box::new(e)
-                    },
+                    |e: std::io::Error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) },
                 );
                 return Ok(builder.body(body.boxed()).unwrap());
             }
@@ -1178,7 +1179,11 @@ fn is_ws_upgrade(headers: &hyper::HeaderMap) -> bool {
     let connection = headers
         .get(hyper::header::CONNECTION)
         .and_then(|v| v.to_str().ok())
-        .map(|v| v.to_ascii_lowercase().split(',').any(|t| t.trim() == "upgrade"))
+        .map(|v| {
+            v.to_ascii_lowercase()
+                .split(',')
+                .any(|t| t.trim() == "upgrade")
+        })
         .unwrap_or(false);
     upgrade && connection
 }
@@ -1195,14 +1200,10 @@ enum FrameError {
     Protocol,
 }
 
-async fn read_ws_frame(
-    io: &mut TokioIo<hyper::upgrade::Upgraded>,
-) -> Result<WsFrame, FrameError> {
+async fn read_ws_frame(io: &mut TokioIo<hyper::upgrade::Upgraded>) -> Result<WsFrame, FrameError> {
     use tokio::io::AsyncReadExt;
     let mut hdr = [0u8; 2];
-    io.read_exact(&mut hdr)
-        .await
-        .map_err(|_| FrameError::Eof)?;
+    io.read_exact(&mut hdr).await.map_err(|_| FrameError::Eof)?;
     let fin = hdr[0] & 0x80 != 0;
     let opcode = hdr[0] & 0x0F;
     let masked = hdr[1] & 0x80 != 0;
@@ -1224,7 +1225,9 @@ async fn read_ws_frame(
     }
     let mut mask = [0u8; 4];
     if masked {
-        io.read_exact(&mut mask).await.map_err(|_| FrameError::Eof)?;
+        io.read_exact(&mut mask)
+            .await
+            .map_err(|_| FrameError::Eof)?;
     } else if opcode <= 0x2 {
         return Err(FrameError::Protocol); // client data frames MUST be masked
     }
@@ -1239,7 +1242,11 @@ async fn read_ws_frame(
             }
         }
     }
-    Ok(WsFrame { fin, opcode, payload })
+    Ok(WsFrame {
+        fin,
+        opcode,
+        payload,
+    })
 }
 
 async fn write_ws_frame(
@@ -1282,7 +1289,7 @@ async fn py_ws_step(
     let res = tokio::task::spawn_blocking(move || {
         Python::with_gil(|py| {
             let helper = py
-                .import_bound("fasterapi._hyper_serve")
+                .import("fasterapi._hyper_serve")
                 .map_err(|e| e.to_string())?;
             let ret = helper
                 .getattr("ws_step")
@@ -1310,7 +1317,7 @@ async fn py_ws_step(
 fn py_ws_close(sid: String) {
     // Best-effort synchronous cleanup (idempotent server-side).
     let _res: Result<(), PyErr> = Python::with_gil(|py| {
-        py.import_bound("fasterapi._hyper_serve")?
+        py.import("fasterapi._hyper_serve")?
             .getattr("ws_close")?
             .call1((sid,))?;
         Ok(())
@@ -1343,7 +1350,10 @@ async fn serve_ws(
         .map(|v| v.trim() == "13")
         .unwrap_or(false);
     if !version_ok {
-        return bad(StatusCode::UPGRADE_REQUIRED, "Sec-WebSocket-Version: 13 required");
+        return bad(
+            StatusCode::UPGRADE_REQUIRED,
+            "Sec-WebSocket-Version: 13 required",
+        );
     }
     let path = req.uri().path().to_string();
     let query = req.uri().query().unwrap_or("").to_string();
@@ -1360,7 +1370,7 @@ async fn serve_ws(
             move || {
                 Python::with_gil(|py| {
                     let helper = py
-                        .import_bound("fasterapi._hyper_serve")
+                        .import("fasterapi._hyper_serve")
                         .map_err(|e| e.to_string())?;
                     let ret = helper
                         .getattr("ws_open")
@@ -1387,7 +1397,10 @@ async fn serve_ws(
     };
     if status != "accepted" {
         let (code, reason) = match status.as_str() {
-            "refused" => (403u16, data.first().map(|d| d.1.clone()).unwrap_or_default()),
+            "refused" => (
+                403u16,
+                data.first().map(|d| d.1.clone()).unwrap_or_default(),
+            ),
             _ => (500u16, "websocket open failed".to_string()),
         };
         let body = format!(r#"{{"detail":{reason:?}}}"#);

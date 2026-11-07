@@ -48,7 +48,10 @@ def _direct_ok(app: Any) -> bool:
                 try:
                     cls = entry[0]
                 except (IndexError, KeyError, TypeError):
-                    return False
+                    try:
+                        cls = tuple(entry)[0]
+                    except (IndexError, TypeError):
+                        return False
             if cls is not AsyncExitStackMiddleware:
                 return False
         return True
@@ -157,23 +160,30 @@ def run_request(
                     continue
                 if match == Match.FULL:
                     scope.update(child_scope)
+                    scope["app"] = app
                     endpoint = getattr(route, "endpoint", None)
                     if endpoint is not None:
                         scope["endpoint"] = endpoint
-                    # Preserve Starlette's route-level exception dispatch while
-                    # avoiding its router scan for a route already matched.
-                    from starlette._exception_handler import wrap_app_handling_exceptions
-                    from starlette.requests import Request
+                    # Restore the exception wrappers skipped with Starlette's
+                    # normal app stack while avoiding its router scan.
+                    from starlette.middleware.errors import ServerErrorMiddleware
+                    from starlette.middleware.exceptions import ExceptionMiddleware
 
                     handlers = getattr(app, "exception_handlers", {})
-                    scope["starlette.exception_handlers"] = (
-                        {key: value for key, value in handlers.items() if not isinstance(key, int)},
-                        {key: value for key, value in handlers.items() if isinstance(key, int)},
+                    exception_handlers = {
+                        key: value
+                        for key, value in handlers.items()
+                        if not isinstance(key, int) and key is not Exception
+                    }
+                    server_error_handler = None
+                    for key, handler in handlers.items():
+                        if key in (500, Exception):
+                            server_error_handler = handler
+                    wrapped = ExceptionMiddleware(
+                        route.app,
+                        handlers=exception_handlers,
+                        debug=bool(getattr(app, "debug", False)),
                     )
-                    wrapped = wrap_app_handling_exceptions(route.app, Request(scope, receive, send))
-                    from starlette.middleware.errors import ServerErrorMiddleware
-
-                    server_error_handler = handlers.get(500) or handlers.get(Exception)
                     wrapped = ServerErrorMiddleware(
                         wrapped,
                         handler=server_error_handler,

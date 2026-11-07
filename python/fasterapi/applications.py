@@ -1,9 +1,9 @@
-"""fasterapi.applications — drop-in ``fastapi.FastAPI``.
+"""fasterapi.applications — FastAPI-compatible app on Starlette's ASGI host.
 
-``FastAPI`` subclasses Starlette (same ASGI engine FastAPI uses) so
-middleware, lifespan, exception handlers and the TestClient behave 1:1,
-while ``build()`` AOT-compiles ``Depends()`` graphs + the Rust radix router
-and ``serve()`` launches the host (uvicorn today, Hyper host when staged).
+``FastAPI`` subclasses Starlette so middleware, lifespan, exception handlers,
+and TestClient use the familiar ASGI stack. ``build()`` compiles dependency
+and native router metadata; ``serve()`` defaults to uvicorn, with an optional
+experimental Hyper host.
 """
 
 from __future__ import annotations
@@ -43,7 +43,7 @@ from .utils import generate_unique_id as generate_unique_id  # noqa: F401
 
 
 class FastAPI(Starlette):
-    """1:1 ``fastapi.FastAPI`` replacement."""
+    """FastAPI-compatible ASGI application."""
 
     def __init__(
         self,

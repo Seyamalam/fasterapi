@@ -2,7 +2,7 @@
 name = "fasterapi"
 version = "0.1.0"
 edition = "2021"
-description = "1:1 FastAPI drop-in replacement with a native Rust (PyO3) core — radix routing, SIMD JSON, type-safe validators, edge guards"
+description = "FastAPI-compatible ASGI framework with native Rust (PyO3) components"
 license = "MIT"
 repository = "https://github.com/Seyamalam/fasterapi"
 rust-version = "1.75"
@@ -13,7 +13,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 # Minimal native core: only what the shipped fast-paths actually use.
-pyo3 = { version = "0.22", features = ["extension-module"] }
+pyo3 = { version = "0.27", features = ["extension-module"] }
 matchit = "0.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

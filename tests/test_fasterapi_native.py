@@ -129,10 +129,14 @@ def test_unbounded_integer_query_matches_python_int_range():
     async def bounded(value: int = Query(ge=5)):
         return {"value": value}
 
+    @app.get("/large-bound")
+    async def large_bound(value: int = Query(ge=9223372036854775809)):
+        return {"value": value}
+
     with _client(app) as client:
         response = client.get("/integer?value=9223372036854775808")
         small_error = client.get("/bounded?value=3")
-        large_error = client.get("/bounded?value=9223372036854775808")
+        large_error = client.get("/large-bound?value=9223372036854775808")
     assert response.status_code == 200
     assert response.json() == {"value": 9223372036854775808}
     assert small_error.status_code == large_error.status_code == 422
@@ -140,7 +144,7 @@ def test_unbounded_integer_query_matches_python_int_range():
     assert large_error.json()["detail"][0]["input"] == "9223372036854775808"
 
 
-def test_hyper_direct_dispatch_uses_registered_exception_handlers():
+def test_hyper_direct_dispatch_preserves_request_app_and_exception_handlers():
     from fasterapi import _hyper_serve
     from fasterapi.responses import JSONResponse
 
@@ -151,7 +155,8 @@ def test_hyper_direct_dispatch_uses_registered_exception_handlers():
         return JSONResponse({"handled": str(exc)}, status_code=418)
 
     @app.get("/error")
-    async def error():
+    async def error(request):
+        assert request.app is app
         raise ValueError("hyper path")
 
     assert _hyper_serve._direct_ok(app)
@@ -168,12 +173,28 @@ def test_hyper_direct_dispatch_uses_registered_exception_handlers():
     assert body == b'{"handled":"hyper path"}'
 
 
+def test_hyper_user_middleware_uses_full_stack():
+    from fasterapi import _hyper_serve
+    from fasterapi.guards import APIKeyGuard
+
+    app = FastAPI()
+    app.add_middleware(APIKeyGuard, api_key="secret")
+
+    @app.get("/secure")
+    async def secure():
+        return {"ok": True}
+
+    assert not _hyper_serve._direct_ok(app)
+    with _client(app) as client:
+        assert client.get("/secure").status_code == 401
+        assert client.get("/secure", headers={"x-api-key": "secret"}).status_code == 200
+
+
 def test_hyper_direct_dispatch_uses_server_error_handler():
     from fasterapi import _hyper_serve
     from fasterapi.responses import JSONResponse
 
     app = FastAPI()
-
     @app.exception_handler(500)
     async def internal_error_handler(request, exc):
         return JSONResponse({"handled": "server error"}, status_code=500)
