@@ -457,6 +457,65 @@ def test_custom_exception_handler_parity(fastapi_client, fasterapi_client):
     assert a.json() == b.json() == {"detail": "value-error:bad value"}
 
 
+def test_custom_http_and_validation_exception_handlers():
+    from fastapi.exceptions import RequestValidationError as GRequestValidationError
+    from fastapi.responses import JSONResponse as GJSONResponse
+
+    from fasterapi import RequestValidationError as FRequestValidationError
+    from fasterapi.responses import JSONResponse as FJSONResponse
+
+    def build_fastapi():
+        app = GFastAPI(
+            exception_handlers={
+                GHTTPException: lambda request, exc: GJSONResponse(
+                    {"custom": exc.detail}, status_code=exc.status_code, headers=exc.headers
+                ),
+                GRequestValidationError: lambda request, exc: GJSONResponse(
+                    {"invalid": True}, status_code=400
+                ),
+            }
+        )
+
+        @app.get("/error")
+        async def error():
+            raise GHTTPException(status_code=409, detail="conflict", headers={"x-error": "custom"})
+
+        @app.get("/validate")
+        async def validate(value: int):
+            return {"value": value}
+
+        return app
+
+    def build_fasterapi():
+        app = F.FastAPI(
+            exception_handlers={
+                FHTTPException: lambda request, exc: FJSONResponse(
+                    {"custom": exc.detail}, status_code=exc.status_code, headers=exc.headers
+                ),
+                FRequestValidationError: lambda request, exc: FJSONResponse(
+                    {"invalid": True}, status_code=400
+                ),
+            }
+        )
+
+        @app.get("/error")
+        async def error():
+            raise FHTTPException(status_code=409, detail="conflict", headers={"x-error": "custom"})
+
+        @app.get("/validate")
+        async def validate(value: int):
+            return {"value": value}
+
+        return app
+
+    with GTestClient(build_fastapi()) as gc, F.TestClient(build_fasterapi()) as fc:
+        for path in ("/error", "/validate?value=nope"):
+            a, b = gc.get(path), fc.get(path)
+            assert (a.status_code, a.json()) == (b.status_code, b.json())
+            if path == "/error":
+                assert a.headers["x-error"] == b.headers["x-error"] == "custom"
+
+
 def test_router_prefix_parity(fastapi_client, fasterapi_client):
     a = fastapi_client.get("/v1/hello/ada?greeting=yo")
     b = fasterapi_client.get("/v1/hello/ada?greeting=yo")

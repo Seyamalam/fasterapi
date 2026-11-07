@@ -116,3 +116,43 @@ def test_http_exception_headers():
         r = c.get("/h")
         assert r.status_code == 403
         assert r.headers.get("x-reason") == "test"
+
+
+def test_unbounded_integer_query_matches_python_int_range():
+    app = FastAPI()
+
+    @app.get("/integer")
+    async def integer(value: int):
+        return {"value": value}
+
+    with _client(app) as client:
+        response = client.get("/integer?value=9223372036854775808")
+    assert response.status_code == 200
+    assert response.json() == {"value": 9223372036854775808}
+
+
+def test_hyper_direct_dispatch_uses_registered_exception_handlers():
+    from fasterapi import _hyper_serve
+    from fasterapi.responses import JSONResponse
+
+    app = FastAPI()
+
+    @app.exception_handler(ValueError)
+    async def value_error_handler(request, exc):
+        return JSONResponse({"handled": str(exc)}, status_code=418)
+
+    @app.get("/error")
+    async def error():
+        raise ValueError("hyper path")
+
+    status, headers, body = _hyper_serve.run_request(
+        app,
+        "GET",
+        "/error",
+        "",
+        [("host", b"localhost")],
+        b"",
+    )
+    assert status == 418
+    assert b"application/json" in dict(headers)["content-type"].encode().lower()
+    assert body == b'{"handled":"hyper path"}'

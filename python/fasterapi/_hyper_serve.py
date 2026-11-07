@@ -151,7 +151,18 @@ def run_request(
                     endpoint = getattr(route, "endpoint", None)
                     if endpoint is not None:
                         scope["endpoint"] = endpoint
-                    await route.app(scope, receive, send)
+                    # Preserve Starlette's route-level exception dispatch while
+                    # avoiding its router scan for a route already matched.
+                    from starlette._exception_handler import wrap_app_handling_exceptions
+                    from starlette.requests import Request
+
+                    handlers = getattr(app, "exception_handlers", {})
+                    scope["starlette.exception_handlers"] = (
+                        {key: value for key, value in handlers.items() if not isinstance(key, int)},
+                        {key: value for key, value in handlers.items() if isinstance(key, int)},
+                    )
+                    wrapped = wrap_app_handling_exceptions(route.app, Request(scope, receive, send))
+                    await wrapped(scope, receive, send)
                     return
         await app(scope, receive, send)
 

@@ -12,7 +12,7 @@ from typing import Any, Optional, TypedDict
 
 from pydantic import BaseModel as BaseModel  # noqa: F401
 from pydantic import create_model
-from starlette.exceptions import HTTPException as StarletteHTTPException  # noqa: F401
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.exceptions import WebSocketException as StarletteWebSocketException  # noqa: F401
 
 
@@ -23,17 +23,16 @@ class EndpointContext(TypedDict, total=False):
     line: int
 
 
-class HTTPException(Exception):
+class HTTPException(StarletteHTTPException):
+    """HTTP error recognized by Starlette's exception middleware."""
+
     def __init__(
         self,
         status_code: int,
         detail: Any = None,
         headers: Optional[dict[str, str]] = None,
     ) -> None:
-        super().__init__(detail)
-        self.status_code = status_code
-        self.detail = detail
-        self.headers = headers
+        super().__init__(status_code=status_code, detail=detail, headers=headers)
 
     def __repr__(self) -> str:
         return f"HTTPException(status_code={self.status_code}, detail={self.detail!r})"

@@ -29,6 +29,7 @@ from .exception_handlers import http_exception_handler as http_exception_handler
 from .exception_handlers import request_validation_exception_handler as request_validation_exception_handler  # noqa: F401
 from .exception_handlers import websocket_request_validation_exception_handler as websocket_request_validation_exception_handler  # noqa: F401
 from .exceptions import HTTPException, RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from .exceptions import WebSocketRequestValidationError as WebSocketRequestValidationError  # noqa: F401
 from .middleware.asyncexitstack import AsyncExitStackMiddleware as AsyncExitStackMiddleware  # noqa: F401
 from .openapi.docs import get_redoc_html as get_redoc_html  # noqa: F401
@@ -88,6 +89,10 @@ class FastAPI(Starlette):
         self.redirect_slashes = redirect_slashes
         self._router = APIRouter(dependencies=dependencies or [])
         self._user_exception_handlers: dict[Any, Callable[..., Any]] = dict(exception_handlers or {})
+        self._install_handler(StarletteHTTPException, http_exception_handler)
+        self._install_handler(RequestValidationError, request_validation_exception_handler)
+        for exc_class, handler in self._user_exception_handlers.items():
+            self._install_handler(exc_class, handler)
         self._built_dag: Optional[CompiledDAG] = None
         self._rust_router: Any = None
         self._extra = extra
@@ -231,24 +236,8 @@ class FastAPI(Starlette):
                     res = await res
                 return res if isinstance(res, Response) else JSONResponse(res)
 
-        # Starlette ≥0.37 / 1.x keeps handlers on the app (not the router).
-        try:
-            super().add_exception_handler(exc_class, _h)  # type: ignore[arg-type]
-        except Exception:
-            pass
-        try:
-            self.exception_handlers[exc_class] = _h  # type: ignore[attr-defined]
-        except Exception:
-            pass
-
-    async def _default_http_exception(self, request: Request, exc: HTTPException) -> Response:
-        handler = self._user_exception_handlers.get(HTTPException) or self._user_exception_handlers.get(Exception)
-        if handler is not None:
-            res = handler(request, exc)
-            if inspect.isawaitable(res):
-                res = await res
-            return res if isinstance(res, Response) else JSONResponse(res)
-        return JSONResponse({"detail": exc.detail}, status_code=exc.status_code, headers=exc.headers or {})
+        # Starlette's exception middleware uses this mapping for route errors.
+        super().add_exception_handler(exc_class, _h)  # type: ignore[arg-type]
 
     # -- openapi ---------------------------------------------------------------
     def openapi(self) -> dict[str, Any]:

@@ -17,9 +17,13 @@ def _resolve(package: str, name: str):  # type: ignore[no-untyped-def]
 def test_top_level_export_parity():
     import fastapi
 
+    # FastAPI's optional native OpenTelemetry module was added after fasterapi's
+    # API surface was defined; do not pretend to re-export it without providing
+    # its instrumentation behavior and dependencies.
+    unsupported = {"telemetry"}
     missing = []
     for name in dir(fastapi):
-        if name.startswith("_"):
+        if name.startswith("_") or name in unsupported:
             continue
         try:
             _resolve("fasterapi", name)

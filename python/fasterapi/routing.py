@@ -12,6 +12,7 @@ from __future__ import annotations
 import inspect
 import json as _stdlib_json
 import sys
+import threading
 import weakref
 from contextlib import AsyncExitStack
 from typing import Any, Callable, Coroutine, Optional, Union, get_origin
@@ -75,6 +76,8 @@ def _is_pydantic_model(tp: Any) -> bool:
 
 _HINTS_CACHE: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 _SIG_CACHE: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+_HINTS_CACHE_LOCK = threading.RLock()
+_SIG_CACHE_LOCK = threading.RLock()
 
 
 def _signature(fn: Callable[..., Any]) -> inspect.Signature | None:
@@ -84,7 +87,8 @@ def _signature(fn: Callable[..., Any]) -> inspect.Signature | None:
     and serve one endpoint's signature to another.
     """
     try:
-        sig = _SIG_CACHE.get(fn)
+        with _SIG_CACHE_LOCK:
+            sig = _SIG_CACHE.get(fn)
     except TypeError:
         sig = None
     if sig is None:
@@ -93,7 +97,8 @@ def _signature(fn: Callable[..., Any]) -> inspect.Signature | None:
         except (TypeError, ValueError):
             return None
         try:
-            _SIG_CACHE[fn] = sig
+            with _SIG_CACHE_LOCK:
+                _SIG_CACHE[fn] = sig
         except TypeError:
             pass
     return sig
@@ -106,7 +111,8 @@ def _resolved_hints(fn: Callable[..., Any]) -> dict[str, Any]:
     (e.g. locally-defined models inside test functions).
     """
     try:
-        hints = _HINTS_CACHE.get(fn)  # type: ignore[arg-type]
+        with _HINTS_CACHE_LOCK:
+            hints = _HINTS_CACHE.get(fn)  # type: ignore[arg-type]
     except TypeError:
         hints = None
     if hints is not None:
@@ -116,7 +122,8 @@ def _resolved_hints(fn: Callable[..., Any]) -> dict[str, Any]:
 
         hints = typing.get_type_hints(fn, include_extras=True)
         try:
-            _HINTS_CACHE[fn] = hints  # type: ignore[index]
+            with _HINTS_CACHE_LOCK:
+                _HINTS_CACHE[fn] = hints  # type: ignore[index]
         except TypeError:
             pass
         return hints
@@ -200,12 +207,31 @@ def _check_constraints(name: str, loc: list[str], value: Any, meta: Optional[Par
 
 
 _ADAPTER_CACHE: dict[Any, TypeAdapter] = {}
+_ADAPTER_CACHE_LOCK = threading.RLock()
 
 
 def _adapter(tp: Any) -> TypeAdapter:
-    if tp not in _ADAPTER_CACHE:
-        _ADAPTER_CACHE[tp] = TypeAdapter(tp)
-    return _ADAPTER_CACHE[tp]
+    with _ADAPTER_CACHE_LOCK:
+        adapter = _ADAPTER_CACHE.get(tp)
+        if adapter is None:
+            adapter = TypeAdapter(tp)
+            _ADAPTER_CACHE[tp] = adapter
+        return adapter
+
+
+def _int_constraints_fit_rust(meta: Optional[Param]) -> bool:
+    """Rust int constraints are i64; avoid truncating fractional bounds."""
+    if meta is None:
+        return True
+    for value in (meta.ge, meta.le, meta.gt, meta.lt):
+        if value is None:
+            continue
+        try:
+            if int(value) != value:
+                return False
+        except (OverflowError, TypeError, ValueError):
+            return False
+    return True
 
 
 def _rust_error_type(msg: str, ann: Any) -> str:
@@ -245,7 +271,12 @@ def _validate_value(loc: list[str], raw: Any, annotation: Any, meta: Optional[Pa
         err = _check_constraints("", loc, raw, meta)
         return raw, err
     # --- Rust fast-path for scalars arriving as strings (query/path/header) ---
-    if isinstance(raw, str) and ann in (int, float, bool, str) and _bridge.HAS_RUST:
+    if (
+        isinstance(raw, str)
+        and ann in (int, float, bool, str)
+        and _bridge.HAS_RUST
+        and (ann is not int or _int_constraints_fit_rust(meta))
+    ):
         try:
             if ann is int:
                 v = _bridge.validate_int_rs(
@@ -276,6 +307,17 @@ def _validate_value(loc: list[str], raw: Any, annotation: Any, meta: Optional[Pa
                 )
                 return v, None
         except Exception as exc:
+            if ann is int:
+                # Python integers are unbounded while the native fast path is
+                # currently i64-based. Preserve Pydantic's behavior on values
+                # outside that range (and on native parse/constraint errors).
+                try:
+                    value = _adapter(int).validate_python(raw)
+                except Exception:
+                    pass
+                else:
+                    err = _check_constraints("", loc, value, meta)
+                    return (value, None) if err is None else (None, err)
             msg = str(exc)
             # Strip Rust `ValueError: ` prefix if present.
             if ": " in msg and msg.split(": ", 1)[0].endswith("Error"):
@@ -862,12 +904,14 @@ class _RouteDef:
 # Models whose instances serialize identically with and without a
 # revalidation round-trip (no validators/serializers that could transform).
 _MODEL_PASSTHROUGH: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+_MODEL_PASSTHROUGH_LOCK = threading.RLock()
 
 
 def _model_dump_direct(model_cls: Any) -> bool:
     """True when `dump_json(instance)` == `dump_json(validate(instance))`."""
     try:
-        direct = _MODEL_PASSTHROUGH.get(model_cls)
+        with _MODEL_PASSTHROUGH_LOCK:
+            direct = _MODEL_PASSTHROUGH.get(model_cls)
     except TypeError:
         direct = None
     if direct is not None:
@@ -888,7 +932,8 @@ def _model_dump_direct(model_cls: Any) -> bool:
     except Exception:
         ok = False
     try:
-        _MODEL_PASSTHROUGH[model_cls] = ok
+        with _MODEL_PASSTHROUGH_LOCK:
+            _MODEL_PASSTHROUGH[model_cls] = ok
     except TypeError:
         pass
     return ok
@@ -1007,13 +1052,10 @@ def _make_http_handler(route: _RouteDef, router_deps: list[Depends]) -> Callable
                     body_json=body_json, form=form, cache=cache, stack=stack,
                     body_raw=body_raw,
                 )
-            except RequestValidationError as exc:
-                await JSONResponse({"detail": exc.errors()}, status_code=422)(scope, receive, send)
-                return
-            except HTTPException as exc:
-                await JSONResponse({"detail": exc.detail}, status_code=exc.status_code,
-                                   headers=exc.headers or {})(scope, receive, send)
-                return
+            except (RequestValidationError, HTTPException):
+                # Let Starlette's exception middleware dispatch registered app
+                # handlers, including user overrides of these framework errors.
+                raise
             try:
                 if inspect.iscoroutinefunction(route.endpoint):
                     result = await route.endpoint(**kwargs)
@@ -1021,13 +1063,8 @@ def _make_http_handler(route: _RouteDef, router_deps: list[Depends]) -> Callable
                     result = route.endpoint(**kwargs)
                     if inspect.isawaitable(result):
                         result = await result
-            except HTTPException as exc:
-                await JSONResponse({"detail": exc.detail}, status_code=exc.status_code,
-                                   headers=exc.headers or {})(scope, receive, send)
-                return
-            except RequestValidationError as exc:
-                await JSONResponse({"detail": exc.errors()}, status_code=422)(scope, receive, send)
-                return
+            except (RequestValidationError, HTTPException):
+                raise
             # SSE: generator endpoint + EventSourceResponse streams frames.
             if _is_sse_route(route) and (inspect.isasyncgen(result) or inspect.isgenerator(result)):
                 await _with_background(_sse_response(result, route.status_code), cache)(scope, receive, send)
