@@ -1049,7 +1049,7 @@ struct PyJob {
     /// False when the request had a `Range` header (sendfile skipped so
     /// partial-content semantics stay exactly Starlette's).
     sendfile_ok: bool,
-    reply: tokio::sync::oneshot::Sender<Result<(u16, Vec<(String, String)>, Vec<u8>), String>>,
+    reply: tokio::sync::oneshot::Sender<Result<(u16, Vec<(String, String)>, Vec<u8>, String), String>>,
 }
 
 fn run_py_job(job: PyJob) {
@@ -1078,10 +1078,24 @@ fn run_py_job(job: PyJob) {
                 job.sendfile_ok,
             ))
             .map_err(|e| e.to_string())?;
-        ret.extract::<(u16, Vec<(String, String)>, Vec<u8>)>()
+        ret.extract::<(u16, Vec<(String, String)>, Vec<u8>, String)>()
             .map_err(|e| e.to_string())
     });
+    // Streaming sessions: reply first, then park this worker driving the
+    // session loop until stream_close (Rust calls it after the body ends).
+    let stream_sid = match &result {
+        Ok(v) => v.3.clone(),
+        Err(_) => String::new(),
+    };
     let _ = job.reply.send(result);
+    if !stream_sid.is_empty() {
+        let _ = Python::with_gil(|py| {
+            py.import("fasterapi._hyper_serve")?
+                .getattr("stream_drive")?
+                .call1((stream_sid,))?;
+            Ok::<(), pyo3::PyErr>(())
+        });
+    }
 }
 
 /// Fixed pool of Python worker threads (one thread-local asyncio loop each).
@@ -1203,7 +1217,7 @@ async fn serve_one(
     };
     // Bounded pool first; overflow degrades to spawn_blocking instead of
     // deadlocking when every worker queue is momentarily full.
-    let out: Result<Result<(u16, Vec<(String, String)>, Vec<u8>), String>, String> =
+    let out: Result<Result<(u16, Vec<(String, String)>, Vec<u8>, String), String>, String> =
         match pool.dispatch(job) {
             Ok(()) => rx.await.map_err(|_| "worker dropped job".to_string()),
             Err(job) => match tokio::task::spawn_blocking(move || {
@@ -1218,7 +1232,7 @@ async fn serve_one(
                 Err(e) => Err(format!("overflow join: {e}")),
             },
         };
-    let (status, resp_headers, resp_body) = match out {
+    let (status, resp_headers, resp_body, stream_sid) = match out {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => {
             eprintln!("fasterapi hyper: handler error: {e}");
@@ -1235,6 +1249,8 @@ async fn serve_one(
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case("x-fasterapi-sendfile"))
         .map(|(_, v)| v.clone());
+    // Streaming responses get chunked encoding — no content-length.
+    let streaming = !stream_sid.is_empty();
     for (k, v) in &resp_headers {
         // Skip hop-by-hop / framing headers the server owns (`server` is
         // re-stamped below — the app layer still thinks in uvicorn terms).
@@ -1246,7 +1262,7 @@ async fn serve_one(
             || kl == "connection"
             || kl == "server"
             || kl.starts_with("x-fasterapi-")
-            || (kl == "content-length" && sendfile_path.is_some())
+            || (kl == "content-length" && (sendfile_path.is_some() || streaming))
         {
             continue;
         }
@@ -1258,6 +1274,70 @@ async fn serve_one(
         }
     }
     builder = builder.header("server", "fasterapi-hyper");
+    // Streaming response: the app is still producing on a Python session —
+    // chunks flow through an mpsc into Hyper's body (chunked encoding).
+    // Client disconnect drops the stream → we stop polling and close the
+    // session (which cancels the app task).
+    if streaming {
+        let (tx, mut rx) =
+            tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
+        let sid = stream_sid.clone();
+        tokio::task::spawn_blocking(move || {
+            // Chunks collected before the stream graduated go out first.
+            if !resp_body.is_empty()
+                && tx.blocking_send(Ok(Bytes::from(resp_body))).is_err()
+            {
+                let _ = Python::with_gil(|py| {
+                    py.import("fasterapi._hyper_serve")?
+                        .getattr("stream_close")?
+                        .call1((sid.clone(),))?;
+                    Ok::<(), pyo3::PyErr>(())
+                });
+                return;
+            }
+            loop {
+                let step = Python::with_gil(|py| {
+                    py.import("fasterapi._hyper_serve")
+                        .and_then(|h| h.getattr("stream_step"))
+                        .and_then(|f| f.call1((sid.clone(), 1.0f64)))
+                        .and_then(|r| r.extract::<(Vec<Vec<u8>>, bool)>())
+                });
+                match step {
+                    Ok((chunks, done)) => {
+                        let mut stop = done;
+                        for chunk in chunks {
+                            if tx.blocking_send(Ok(Bytes::from(chunk))).is_err() {
+                                stop = true;
+                                break;
+                            }
+                        }
+                        if stop {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("fasterapi hyper: stream_step: {e}");
+                        break;
+                    }
+                }
+            }
+            let _ = Python::with_gil(|py| {
+                py.import("fasterapi._hyper_serve")?
+                    .getattr("stream_close")?
+                    .call1((sid,))?;
+                Ok::<(), pyo3::PyErr>(())
+            });
+        });
+        use futures_util::StreamExt;
+        use http_body_util::BodyExt as _BodyExt;
+        let stream = futures_util::stream::poll_fn(move |cx| rx.poll_recv(cx))
+            .map(|r| r.map(hyper::body::Frame::data));
+        let body = _BodyExt::map_err(
+            http_body_util::StreamBody::new(stream),
+            |e: std::io::Error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) },
+        );
+        return Ok(builder.body(body.boxed()).unwrap());
+    }
     // Zero-copy file streaming: the app already sent content headers; the
     // bytes flow straight from disk, never through Python.
     if let Some(path) = sendfile_path {
@@ -1288,11 +1368,12 @@ async fn serve_one(
     Ok(builder.body(boxed_full(Bytes::from(resp_body))).unwrap())
 }
 
-fn internal_error() -> (u16, Vec<(String, String)>, Vec<u8>) {
+fn internal_error() -> (u16, Vec<(String, String)>, Vec<u8>, String) {
     (
         500u16,
         vec![("content-type".to_string(), "application/json".to_string())],
         br#"{"detail":"Internal Server Error"}"#.to_vec(),
+        String::new(),
     )
 }
 

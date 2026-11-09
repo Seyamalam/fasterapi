@@ -32,6 +32,16 @@ are `0.x` until the Hyper host promotes to default.
   on `include_router` (deprecation-warned, matches FastAPI semantics).
 - **`fasterapi.openapi.webhooks`** module (import-surface parity).
 - **`FASTERAPI_MAX_BODY`** env var tunes the Hyper body cap (16 MiB default).
+- **True streaming on Hyper**: responses that keep producing past a 30ms
+  settle graduate to a real-time session — chunks flow through an mpsc into
+  Hyper's body writer (chunked encoding), the client sees incremental bytes,
+  and client disconnect cancels the app task. `receive()` now correctly
+  pends for disconnect instead of returning it eagerly.
+- **WebSocket subprotocol negotiation** on Hyper: `sec-websocket-protocol`
+  offers reach `scope["subprotocols"]`; the app's `accept(subprotocol=...)`
+  is echoed in the 101.
+- Hyper host gate run: ~x1.03 uvicorn RPS on a micro-JSON workload
+  (5453 vs 5316 rps loopback) — first parity-or-better measurement.
 - GitHub Actions CI (test matrix 3.10–3.14 + lint + wheel builds on tags)
   and a ruff advisory gate in `pre-commit`.
 - `tests/test_parity_extended.py`: 23 differential tests — multi-dep error

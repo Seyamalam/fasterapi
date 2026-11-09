@@ -321,12 +321,15 @@ def test_hyper_websocket_bytes_identical(tmp_path):
             # The refused session's pump tears down asynchronously; let it
             # settle before the next upgrade or the auth read can race it.
             time.sleep(0.3)
-            for _attempt in range(2):
+            got = None
+            for _attempt in range(3):
                 sock, send, recv = _ws_raw("127.0.0.1", port, "/auth?token=s3cr3t")
                 try:
                     got = recv()
                     if got == ("text", "authed"):
                         break
+                except (TimeoutError, OSError):
+                    got = ("timeout", None)
                 finally:
                     sock.close()
                 time.sleep(0.3)

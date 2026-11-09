@@ -125,21 +125,38 @@ def run_request(
     }
     pending: list[dict[str, Any]] = [{"type": "http.request", "body": bytes(body), "more_body": False}]
     sent: dict[str, Any] = {}
+    out_q: asyncio.Queue = asyncio.Queue()
+    # ASGI: after the request body, receive() pends until disconnect — never
+    # return an eager disconnect (StreamingResponse's watcher would cancel
+    # the response after the first chunk). Set by stream_close on real
+    # client disconnect.
+    disconnect = asyncio.Event()
 
     async def receive() -> dict[str, Any]:
         if pending:
             return pending.pop(0)
+        await disconnect.wait()
         return {"type": "http.disconnect"}
 
     async def send(message: dict[str, Any]) -> None:
-        mtype = message.get("type")
-        if mtype == "http.response.start":
-            sent["status"] = int(message.get("status", 500))
-            sent["headers"] = [
-                (k.decode("latin-1"), v.decode("latin-1")) for k, v in message.get("headers", [])
-            ]
-        elif mtype == "http.response.body":
-            sent.setdefault("chunks", []).append(bytes(message.get("body", b"")))
+        await out_q.put(message)
+
+    def _collect() -> None:
+        while True:
+            try:
+                message = out_q.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            mtype = message.get("type")
+            if mtype == "http.response.start":
+                sent["status"] = int(message.get("status", 500))
+                sent["headers"] = [
+                    (k.decode("latin-1"), v.decode("latin-1")) for k, v in message.get("headers", [])
+                ]
+            elif mtype == "http.response.body":
+                sent.setdefault("chunks", []).append(bytes(message.get("body", b"")))
+                if message.get("more_body"):
+                    sent["stream"] = True
 
     async def _go() -> None:
         if _direct_ok(app):
@@ -193,18 +210,138 @@ def run_request(
                     return
         await app(scope, receive, send)
 
+    loop = _get_loop()
+    task = loop.create_task(_go())
     try:
-        _get_loop().run_until_complete(_go())
+        while True:
+            # Drive the app for a settle window. Fast requests finish inside
+            # it (zero overhead vs before); a response that started streaming
+            # (`http.response.start` + a chunk with `more_body`) and is still
+            # producing graduates to the session path — real chunks, real-time.
+            loop.run_until_complete(asyncio.wait({task}, timeout=_STREAM_SETTLE_S))
+            _collect()
+            if task.done():
+                exc = task.exception()
+                if exc is not None:
+                    if "status" not in sent:
+                        raise exc
+                    # Starlette's ServerErrorMiddleware sends its response and
+                    # then re-raises so servers can log. The bridge returns the
+                    # already-sent response rather than a generic 500.
+                    traceback.print_exception(exc)
+                break
+            if "status" in sent and sent.get("stream"):
+                import secrets as _secrets
+
+                sid = _secrets.token_hex(8)
+                with _STREAM_LOCK:
+                    _STREAM_SESSIONS[sid] = {
+                        "loop": loop, "task": task, "out": out_q,
+                        "disconnect": disconnect,
+                    }
+                return (sent.get("status", 200), sent.get("headers", []),
+                        b"".join(sent.get("chunks", [])), sid)
     except Exception:
         if "status" not in sent:
             traceback.print_exc()
             raise
-        # Starlette's ServerErrorMiddleware sends its response and then
-        # re-raises so servers can log the exception. This bridge returns the
-        # already-sent response to Hyper rather than replacing it with its own
-        # generic 500 payload.
         traceback.print_exc()
-    return sent.get("status", 500), sent.get("headers", []), b"".join(sent.get("chunks", []))
+    return sent.get("status", 500), sent.get("headers", []), b"".join(sent.get("chunks", [])), ""
+
+
+_STREAM_SESSIONS: dict[str, dict[str, Any]] = {}
+_STREAM_LOCK = threading.Lock()
+# How long a response may produce before it's treated as streaming.
+_STREAM_SETTLE_S = 0.03
+
+
+def stream_drive(sid: str) -> None:
+    """Park the calling worker: drive the session loop until stream_close.
+
+    Called by the Rust worker AFTER the reply (status/headers/sid) has been
+    handed back — the loop must run forever for stream_step's
+    run_coroutine_threadsafe calls to execute.
+    """
+    with _STREAM_LOCK:
+        session = _STREAM_SESSIONS.get(sid)
+    if session is None:
+        return
+    try:
+        session["loop"].run_forever()
+    except Exception:
+        pass
+
+
+def stream_step(sid: str, wait_secs: float = 1.0) -> tuple[list[bytes], bool]:
+    """Drain pending body chunks; ``(chunks, done)``.
+
+    Blocks up to ``wait_secs`` for the next chunk (Rust keeps the socket
+    write loop in spawn_blocking). A client disconnect makes Rust stop
+    calling and invoke ``stream_close``.
+    """
+    with _STREAM_LOCK:
+        session = _STREAM_SESSIONS.get(sid)
+    if session is None:
+        return [], True
+    loop, out_q, task = session["loop"], session["out"], session["task"]
+
+    async def _drain() -> list[dict[str, Any]]:
+        msgs: list[dict[str, Any]] = []
+        try:
+            first = await asyncio.wait_for(out_q.get(), timeout=wait_secs)
+        except asyncio.TimeoutError:
+            first = None
+        if first is not None:
+            msgs.append(first)
+        while True:
+            try:
+                msgs.append(out_q.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        return msgs
+
+    try:
+        msgs = asyncio.run_coroutine_threadsafe(_drain(), loop).result(wait_secs + 5.0)
+    except Exception:
+        return [], True
+    chunks: list[bytes] = []
+    done = task.done()
+    for m in msgs:
+        if m.get("type") == "http.response.body":
+            b = m.get("body", b"")
+            if b:
+                chunks.append(bytes(b))
+            if not m.get("more_body"):
+                done = True
+        elif m.get("type") == "http.response.start":
+            pass
+    if done:
+        stream_close(sid)
+    return chunks, done
+
+
+def stream_close(sid: str) -> None:
+    """Tear down a stream session: cancel the app task, stop the loop."""
+    with _STREAM_LOCK:
+        session = _STREAM_SESSIONS.pop(sid, None)
+    if session is None:
+        return
+    loop, task = session["loop"], session["task"]
+    disconnect = session.get("disconnect")
+
+    def _stop() -> None:
+        try:
+            if disconnect is not None:
+                disconnect.set()
+            if not task.done():
+                task.cancel()
+        finally:
+            loop.stop()
+
+    try:
+        loop.call_soon_threadsafe(_stop)
+    except Exception:
+        pass
 
 
 def hyper_available() -> bool:
@@ -252,7 +389,13 @@ def ws_open(app: Any, path: str, query_string: str, headers: list[tuple[str, byt
         "headers": raw_headers,
         "client": ("127.0.0.1", 0),
         "server": ("fasterapi-hyper", 0),
-        "subprotocols": [],
+        "subprotocols": [
+            s.strip()
+            for name, value in headers
+            if name.lower() == "sec-websocket-protocol"
+            for s in value.decode("latin-1").split(",")
+            if s.strip()
+        ],
         "extensions": {"websocket.open": {}},
     }
     loop: asyncio.AbstractEventLoop = asyncio.new_event_loop()
@@ -331,6 +474,9 @@ def ws_open(app: Any, path: str, query_string: str, headers: list[tuple[str, byt
                     pass
         accept_headers = [(k.decode("latin-1"), v.decode("latin-1"))
                           for k, v in accept.get("headers", [])]
+        subprotocol = accept.get("subprotocol")
+        if subprotocol:
+            accept_headers.append(("sec-websocket-protocol", subprotocol))
         return sid, "accepted", [(_ws_accept_key(ws_key), "")] + accept_headers
     for message in first:
         if message.get("type") == "websocket.close":

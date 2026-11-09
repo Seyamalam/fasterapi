@@ -160,7 +160,7 @@ def test_hyper_direct_dispatch_preserves_request_app_and_exception_handlers():
         raise ValueError("hyper path")
 
     assert _hyper_serve._direct_ok(app)
-    status, headers, body = _hyper_serve.run_request(
+    status, headers, body, _sid = _hyper_serve.run_request(
         app,
         "GET",
         "/error",
@@ -204,7 +204,7 @@ def test_hyper_direct_dispatch_uses_server_error_handler():
         raise RuntimeError("server error")
 
     assert _hyper_serve._direct_ok(app)
-    status, _headers, body = _hyper_serve.run_request(
+    status, _headers, body, _sid = _hyper_serve.run_request(
         app, "GET", "/error", "", [("host", b"localhost")], b""
     )
     assert status == 500
