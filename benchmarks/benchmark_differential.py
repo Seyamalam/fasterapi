@@ -225,7 +225,7 @@ def micro_benchmarks() -> dict:
     fast_load = time.perf_counter() - t0
     t0 = time.perf_counter()
     for _ in range(N):
-        _stdlib.dumps(obj)
+        _stdlib.dumps(obj, separators=(",", ":"), ensure_ascii=False)
     std_dump = time.perf_counter() - t0
     t0 = time.perf_counter()
     for _ in range(N):

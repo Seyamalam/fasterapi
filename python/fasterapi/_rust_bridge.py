@@ -72,17 +72,28 @@ except Exception:  # pure-python fallback
 # ---------------------------------------------------------------- JSON ---
 
 def fast_json_loads(payload: str) -> Any:
-    """Parse JSON, SIMD path in Rust when available."""
-    if HAS_RUST:
-        return _rs_loads(payload)  # type: ignore[misc]
+    """Parse JSON.
+
+    Measured at all payload sizes (x0.6–0.8): materializing a generic
+    serde tree and walking it into PyObjects cannot beat CPython's fused
+    C parser — PyObject creation dominates and is identical either way.
+    Stdlib is therefore the primitive here; the Rust parser remains
+    exported for Rust-internal flows. Bodies with a model go through
+    Pydantic `validate_json` (single-pass, x2+) and never touch this.
+    """
     return json.loads(payload)
 
 
-def fast_json_dumps(obj: Any) -> str:
-    """Serialize JSON, Rust path when available."""
+def fast_json_dumps(obj: Any, *, strict: bool = False) -> str:
+    """Serialize to compact UTF-8 JSON, Rust writer when available.
+
+    ``strict=True`` mirrors ``json.dumps(..., allow_nan=False)``: non-finite
+    floats raise ``ValueError`` instead of emitting NaN/Infinity.
+    """
     if HAS_RUST:
-        return _rs_dumps(obj)  # type: ignore[misc]
-    return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+        return _rs_dumps(obj, strict)  # type: ignore[misc]
+    return json.dumps(obj, separators=(",", ":"), ensure_ascii=False,
+                      allow_nan=not strict)
 
 
 # -------------------------------------------------------------- Router ---

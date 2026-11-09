@@ -18,20 +18,29 @@ from starlette.responses import JSONResponse, Response
 from . import _rust_bridge as _bridge
 
 
-class RateLimiter(BaseHTTPMiddleware):
-    """Token-bucket rate limiter middleware (per-process, thread-safe)."""
+class RateLimiter:
+    """Token-bucket rate limiter (per-process, thread-safe).
 
-    def __init__(self, app: Any, per_second: int = 100, burst: Optional[int] = None) -> None:
-        super().__init__(app)
+    Pure ASGI middleware: the bucket is checked off the raw scope with no
+    ``Request`` allocation, so rejection costs ~nothing even under uvicorn.
+    Under the Hyper host the same bucket object is checked in Rust at socket
+    level, before any Python runs. ``app.add_middleware`` shares the bucket
+    across registrations on the same app.
+    """
+
+    def __init__(self, app: Any, per_second: int = 100, burst: Optional[int] = None,
+                 bucket: Any = None) -> None:
+        self.app = app
         self.per_second = per_second
         self.burst = burst
-        self.bucket = _bridge.make_token_bucket(per_second, burst)
+        self.bucket = bucket if bucket is not None else _bridge.make_token_bucket(per_second, burst)
 
-    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
-        allowed = self.bucket.check()
-        if not allowed:
-            return JSONResponse({"detail": "Rate limit exceeded"}, status_code=429)
-        return await call_next(request)
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] != "http" or self.bucket.check():
+            await self.app(scope, receive, send)
+            return
+        response = JSONResponse({"detail": "Rate limit exceeded"}, status_code=429)
+        await response(scope, receive, send)
 
 
 class APIKeyGuard(BaseHTTPMiddleware):

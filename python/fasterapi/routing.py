@@ -9,6 +9,7 @@ shaped like FastAPI (``{"detail": [...]}``, 422).
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json as _stdlib_json
 import sys
@@ -369,6 +370,60 @@ def _validate_value(loc: list[str], raw: Any, annotation: Any, meta: Optional[Pa
 
 # ------------------------------------------------------- dependency core ---
 
+_PURE_CACHE: "weakref.WeakKeyDictionary[Any, bool]" = weakref.WeakKeyDictionary()
+_PURE_LOCK = threading.Lock()
+
+
+def _dep_tree_pure_uncached(fn: Any, _seen: Optional[set[int]] = None) -> bool:
+    """True when neither ``fn`` nor any transitive ``Depends`` yields.
+
+    Yield dependencies register teardowns on the exit stack; their order is
+    load-bearing (LIFO teardown), so only pure subtrees may be fanned out
+    concurrently. Class deps are checked through ``__init__``; callable
+    instances through ``__call__``.
+    """
+    seen = _seen if _seen is not None else set()
+    if fn is None or id(fn) in seen:
+        return True
+    seen.add(id(fn))
+    if inspect.isgeneratorfunction(fn) or inspect.isasyncgenfunction(fn):
+        return False
+    target = fn
+    if inspect.isclass(fn) and not _is_pydantic_model(fn):
+        target = getattr(fn, "__init__", fn)
+        if inspect.isgeneratorfunction(target) or inspect.isasyncgenfunction(target):
+            return False
+    if not (inspect.isfunction(fn) or inspect.isclass(fn) or inspect.ismethod(fn)):
+        call = getattr(fn, "__call__", None)
+        if inspect.isgeneratorfunction(call) or inspect.isasyncgenfunction(call):
+            return False
+    from .dag import _iter_dep_callables
+
+    for _pname, dep in _iter_dep_callables(target):
+        if dep.dependency is not None and not _dep_tree_pure_uncached(dep.dependency, seen):
+            return False
+    return True
+
+
+def _dep_tree_pure(fn: Any) -> bool:
+    """Weak-key memoized ``_dep_tree_pure_uncached`` (deps are static)."""
+    try:
+        with _PURE_LOCK:
+            cached = _PURE_CACHE.get(fn)
+    except TypeError:
+        return _dep_tree_pure_uncached(fn)
+    if cached is not None:
+        return cached
+    val = _dep_tree_pure_uncached(fn)
+    try:
+        with _PURE_LOCK:
+            _PURE_CACHE[fn] = val
+    except TypeError:
+        pass
+    return val
+
+
+
 async def _call_with_teardown(fn: Callable[..., Any], kwargs: dict[str, Any], stack: AsyncExitStack) -> Any:
     """Call sync/async/generator dependency; `yield` values enter the stack."""
     if inspect.isasyncgenfunction(fn):
@@ -426,10 +481,103 @@ async def _solve_fn_kwargs(
     stack: AsyncExitStack,
     body_raw: Optional[bytes] = None,
 ) -> dict[str, Any]:
-    """Resolve kwargs for an endpoint *or* a dependency (recursive)."""
+    """Resolve kwargs for an endpoint *or* a dependency; raises on errors."""
+    kwargs, errors = await _solve_inner(
+        fn, request=request, path_params=path_params, query=query,
+        headers=headers, cookies=cookies, body_json=body_json, form=form,
+        cache=cache, stack=stack, body_raw=body_raw, dep_locks={},
+    )
+    if errors:
+        raise RequestValidationError(errors)
+    return kwargs
+
+
+async def _solve_inner(
+    fn: Callable[..., Any],
+    *,
+    request: Request,
+    path_params: dict[str, Any],
+    query: dict[str, str],
+    headers: dict[str, str],
+    cookies: dict[str, str],
+    body_json: Any,
+    form: Optional[dict[str, Any]],
+    cache: dict[int, Any],
+    stack: AsyncExitStack,
+    dep_locks: dict[int, asyncio.Lock],
+    body_raw: Optional[bytes] = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Resolve kwargs for an endpoint *or* a dependency (recursive).
+
+    Returns ``(kwargs, errors)`` — validation errors travel as data like
+    FastAPI's ``solve_dependencies`` so sibling deps/params still solve and
+    the 422 lists every failure. Exceptions (HTTPException, aborts) raise.
+
+    Yield-free ``Depends`` subtrees launch eagerly and are consumed in
+    signature order: identical results and error ordering to a sequential
+    solve, but independent deps' I/O overlaps. Yield deps stay sequential —
+    their stack-entry order fixes teardown order.
+    """
     sig = _signature(fn)
     if sig is None:
-        return {}
+        return {}, []
+
+    async def _resolve_pending(dep_fn: Any, dep_default: Depends,
+                               cache_key: int) -> tuple[str, Any, list[dict[str, Any]]]:
+        """Solve one yield-free dep; never raises (exceptions returned)."""
+        try:
+            if dep_default.use_cache:
+                lock = dep_locks.get(cache_key)
+                if lock is None:
+                    dep_locks[cache_key] = lock = asyncio.Lock()
+                async with lock:
+                    if cache_key in cache:
+                        return "ok", cache[cache_key], []
+                    sub_kwargs, sub_errors = await _solve_inner(
+                        dep_fn, request=request, path_params=path_params,
+                        query=query, headers=headers, cookies=cookies,
+                        body_json=body_json, form=form, cache=cache,
+                        stack=stack, body_raw=body_raw, dep_locks=dep_locks,
+                    )
+                    if sub_errors:
+                        return "ok", None, sub_errors
+                    value = await _call_with_teardown(dep_fn, sub_kwargs, stack)
+                    cache[cache_key] = value
+                    return "ok", value, []
+            sub_kwargs, sub_errors = await _solve_inner(
+                dep_fn, request=request, path_params=path_params,
+                query=query, headers=headers, cookies=cookies,
+                body_json=body_json, form=form, cache=cache,
+                stack=stack, body_raw=body_raw, dep_locks=dep_locks,
+            )
+            if sub_errors:
+                return "ok", None, sub_errors
+            return "ok", await _call_with_teardown(dep_fn, sub_kwargs, stack), []
+        except BaseException as exc:
+            return "err", exc, []
+
+    # Pre-launch yield-free sibling deps so their I/O overlaps. Results are
+    # consumed in signature order inside the loop, preserving sequential
+    # semantics (first exception wins at its position).
+    pending: dict[str, asyncio.Task] = {}
+    for pname, param in sig.parameters.items():
+        default = param.default
+        if not isinstance(default, Depends):
+            continue
+        dep_fn = default.dependency
+        ann = _ann_of(fn, pname, param.annotation)
+        if dep_fn is None:
+            if not (inspect.isclass(ann) or inspect.isfunction(ann)):
+                continue
+            dep_fn = ann
+        cache_key = id(dep_fn)
+        if (default.use_cache and cache_key in cache
+                or (inspect.isclass(dep_fn) and not _is_pydantic_model(dep_fn))
+                or not _dep_tree_pure(dep_fn)):
+            continue
+        pending[pname] = asyncio.ensure_future(
+            _resolve_pending(dep_fn, default, cache_key)
+        )
     kwargs: dict[str, Any] = {}
     errors: list[dict[str, Any]] = []
     for pname, param in sig.parameters.items():
@@ -477,17 +625,29 @@ async def _solve_fn_kwargs(
                 else:
                     errors.append(_missing(["query", pname]))
                     continue
+            if pname in pending:
+                tag, value, sub_errors = await pending[pname]
+                if tag == "err":
+                    raise value
+                if sub_errors:
+                    errors.extend(sub_errors)
+                else:
+                    kwargs[pname] = value
+                continue
             cache_key = id(dep_fn)
             if default.use_cache and cache_key in cache:
                 kwargs[pname] = cache[cache_key]
                 continue
             # Support class dependencies: instantiate with solved kwargs
             if inspect.isclass(dep_fn) and not _is_pydantic_model(dep_fn):
-                sub_kwargs = await _solve_fn_kwargs(
+                sub_kwargs, sub_errors = await _solve_inner(
                     dep_fn.__init__, request=request, path_params=path_params, query=query,
                     headers=headers, cookies=cookies, body_json=body_json, form=form,
-                    cache=cache, stack=stack, body_raw=body_raw,
+                    cache=cache, stack=stack, body_raw=body_raw, dep_locks=dep_locks,
                 )
+                if sub_errors:
+                    errors.extend(sub_errors)
+                    continue
                 sub_kwargs.pop("self", None)
                 try:
                     instance = dep_fn(**sub_kwargs)
@@ -497,11 +657,14 @@ async def _solve_fn_kwargs(
                     cache[cache_key] = instance
                 kwargs[pname] = instance
                 continue
-            sub_kwargs = await _solve_fn_kwargs(
+            sub_kwargs, sub_errors = await _solve_inner(
                 dep_fn, request=request, path_params=path_params, query=query,
                 headers=headers, cookies=cookies, body_json=body_json, form=form,
-                cache=cache, stack=stack, body_raw=body_raw,
+                cache=cache, stack=stack, body_raw=body_raw, dep_locks=dep_locks,
             )
+            if sub_errors:
+                errors.extend(sub_errors)
+                continue
             value = await _call_with_teardown(dep_fn, sub_kwargs, stack)
             if default.use_cache:
                 cache[cache_key] = value
@@ -551,24 +714,18 @@ async def _solve_fn_kwargs(
                     else:
                         kwargs[pname] = val
                 else:
-                    if meta.has_default() and meta.default is not Ellipsis:
-                        kwargs[pname] = meta.default
-                    elif param.default is inspect.Parameter.empty and meta.required:
+                    if meta.required:
                         errors.append(_missing(["query", alias]))
-                    elif meta.has_default():
-                        kwargs[pname] = meta.default
                     else:
-                        kwargs[pname] = None
+                        kwargs[pname] = meta.default
             elif meta.in_ == "header":
                 key = alias.replace("_", "-").lower()
                 raw = headers.get(key, headers.get(alias.lower()))
                 if raw is None:
-                    if meta.has_default() and meta.default is not Ellipsis:
-                        kwargs[pname] = meta.default
-                    elif meta.required and param.default is inspect.Parameter.empty:
+                    if meta.required:
                         errors.append(_missing(["header", alias]))
                     else:
-                        kwargs[pname] = meta.default if meta.has_default() else None
+                        kwargs[pname] = meta.default
                 else:
                     val, err = _validate_value(["header", alias], raw, ann, meta)
                     if err:
@@ -578,12 +735,10 @@ async def _solve_fn_kwargs(
             elif meta.in_ == "cookie":
                 raw = cookies.get(alias)
                 if raw is None:
-                    if meta.has_default() and meta.default is not Ellipsis:
-                        kwargs[pname] = meta.default
-                    elif meta.required and param.default is inspect.Parameter.empty:
+                    if meta.required:
                         errors.append(_missing(["cookie", alias]))
                     else:
-                        kwargs[pname] = meta.default if meta.has_default() else None
+                        kwargs[pname] = meta.default
                 else:
                     val, err = _validate_value(["cookie", alias], raw, ann, meta)
                     if err:
@@ -652,9 +807,7 @@ async def _solve_fn_kwargs(
         # Required: decide loc — query by default (FastAPI behavior)
         errors.append(_missing(["query", pname]))
 
-    if errors:
-        raise RequestValidationError(errors)
-    return kwargs
+    return kwargs, errors
 
 
 def _json_body_type(ann: Any) -> bool:
@@ -883,6 +1036,10 @@ class _RouteDef:
         description: Optional[str] = None,
         dependencies: Optional[list[Depends]] = None,
         name: Optional[str] = None,
+        include_in_schema: bool = True,
+        openapi_extra: Optional[dict[str, Any]] = None,
+        callbacks: Optional[list[Any]] = None,
+        responses: Optional[dict[Any, Any]] = None,
     ) -> None:
         self.path = path
         self.endpoint = endpoint
@@ -891,6 +1048,10 @@ class _RouteDef:
         self.status_code = status_code
         self.response_class = response_class
         self.deprecated = deprecated
+        self.include_in_schema = include_in_schema
+        self.openapi_extra = openapi_extra
+        self.callbacks = callbacks
+        self.responses = responses
         self.response_model_include = response_model_include
         self.response_model_exclude = response_model_exclude
         self.response_model_by_alias = response_model_by_alias
@@ -989,6 +1150,23 @@ def _serialize_response(result: Any, route: _RouteDef) -> Any:
         return Response(content=result.model_dump_json().encode("utf-8"),
                         status_code=status_code, media_type="application/json")
     return jsonable_encoder(result)
+
+
+class _FastJSONResponse(JSONResponse):
+    """``JSONResponse`` rendered by the Rust direct-writer when compiled.
+
+    Output is byte-identical to Starlette's render (compact separators,
+    raw UTF-8, ``allow_nan=False``); any writer error falls back to the
+    stdlib path so failure modes stay identical too.
+    """
+
+    def render(self, content: Any) -> bytes:
+        if _bridge.HAS_RUST:
+            try:
+                return _bridge.fast_json_dumps(content, strict=True).encode("utf-8")
+            except Exception:
+                pass
+        return super().render(content)
 
 
 def _make_http_handler(route: _RouteDef, router_deps: list[Depends]) -> Callable[..., Any]:
@@ -1090,7 +1268,7 @@ def _make_http_handler(route: _RouteDef, router_deps: list[Depends]) -> Callable
             if isinstance(payload, Response):
                 await _with_background(payload, cache)(scope, receive, send)
                 return
-            await _with_background(JSONResponse(payload, status_code=route.status_code), cache)(scope, receive, send)
+            await _with_background(_FastJSONResponse(payload, status_code=route.status_code), cache)(scope, receive, send)
 
     # Name the handler for Starlette route introspection.
     asgi_app.__name__ = getattr(route.endpoint, "__name__", "handler")  # type: ignore[attr-defined]
@@ -1183,6 +1361,8 @@ class APIRouter:
         self.routes: list[_RouteDef] = []
         self.websocket_routes: list[tuple[str, Callable[..., Any], Optional[str]]] = []
         self._sub_routers: list[tuple["APIRouter", str]] = []
+        self.on_startup: list[Callable[..., Any]] = []
+        self.on_shutdown: list[Callable[..., Any]] = []
 
     # -- registration ------------------------------------------------------
     def add_api_route(
@@ -1207,6 +1387,10 @@ class APIRouter:
         operation_id: Optional[str] = None,
         dependencies: Optional[list[Depends]] = None,
         name: Optional[str] = None,
+        include_in_schema: bool = True,
+        openapi_extra: Optional[dict[str, Any]] = None,
+        callbacks: Optional[list[Any]] = None,
+        responses: Optional[dict[Any, Any]] = None,
         **_extra: Any,
     ) -> None:
         # Empty sub-path ("@router.post(\"\")") addresses the prefix itself —
@@ -1235,6 +1419,9 @@ class APIRouter:
                 summary=summary, description=description,
                 dependencies=[*self.dependencies, *(dependencies or [])],
                 name=name,
+                include_in_schema=include_in_schema, openapi_extra=openapi_extra,
+                callbacks=callbacks,
+                responses=responses if responses is not None else self.responses,
             )
         )
 
@@ -1290,6 +1477,27 @@ class APIRouter:
 
         return deco
 
+    def on_event(self, event_type: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        """Deprecated ``@router.on_event("startup"|"shutdown")`` parity."""
+        import warnings
+
+        warnings.warn(
+            "on_event is deprecated, use lifespan event handlers instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
+        def deco(fn: Callable[..., Any]) -> Callable[..., Any]:
+            if event_type == "startup":
+                self.on_startup.append(fn)
+            elif event_type == "shutdown":
+                self.on_shutdown.append(fn)
+            else:
+                raise ValueError(f"unknown event type {event_type!r}")
+            return fn
+
+        return deco
+
     def include_router(
         self,
         router: "APIRouter",
@@ -1316,12 +1524,17 @@ class APIRouter:
                 tags=[*r.tags, *extra_tags], summary=r.summary,
                 description=r.description,
                 dependencies=[*r.dependencies, *extra_deps], name=r.name,
+                include_in_schema=r.include_in_schema, openapi_extra=r.openapi_extra,
+                callbacks=r.callbacks, responses=r.responses,
             )
             # re-root with self prefix
             merged.path = self.prefix + merged.path
             self.routes.append(merged)
         for path, fn, name in router.websocket_routes:
             self.websocket_routes.append((self.prefix + prefix.rstrip("/") + path, fn, name))
+        # on_event handlers merge into the including router (FastAPI parity).
+        self.on_startup.extend(router.on_startup)
+        self.on_shutdown.extend(router.on_shutdown)
 
     # -- starlette conversion ------------------------------------------------
     def _starlette_routes(self) -> list[Any]:

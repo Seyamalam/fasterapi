@@ -6,6 +6,46 @@ are `0.x` until the Hyper host promotes to default.
 ## [Unreleased]
 
 ### Added
+- **Radix-tree dispatch is live**: `FastRouter` compiles all plain routes
+  into `matchit` and answers unambiguous FULL matches in Rust; ambiguous
+  orderings, Mount/Host entries, convertor patterns, method mismatches and
+  redirects defer to Starlette's scan — byte-identical semantics.
+- **DI fan-out**: yield-free `Depends` subtrees resolve concurrently
+  (signature-ordered results, per-dep locks for `use_cache`, deterministic
+  first-exception-wins). Yield deps stay sequential to preserve teardown
+  order. Dependency validation errors now collect across all siblings like
+  FastAPI (`{"detail": [...]}` lists every failure).
+- **Fast JSON writer** (`itoa`/`ryu`, byte-wise escaping, Python-`repr`
+  float adapter): `fast_json_dumps` ~x2.5 vs compact stdlib, byte-identical
+  output (`ensure_ascii=False` contract, coerced-key quoting, `strict=`
+  mirrors `allow_nan=False`). Wired into the default response path via
+  `_FastJSONResponse`.
+- **Socket-level rate limiting on Hyper**: `RateLimiter` is now a pure-ASGI
+  middleware (no `Request` allocation); its bucket is registered on the app
+  and checked in Rust before any Python runs (`429` pre-parse). Under
+  uvicorn the same pure-ASGI path applies.
+- **Route kwargs**: `include_in_schema`, `openapi_extra`, `callbacks`,
+  `responses` (route-level merge over router default) — all wired into
+  `get_openapi`.
+- **`app.mount()`** verified for ASGI sub-apps and `StaticFiles`.
+- **`on_event("startup"|"shutdown")`** on `FastAPI`/`APIRouter` with merge
+  on `include_router` (deprecation-warned, matches FastAPI semantics).
+- **`fasterapi.openapi.webhooks`** module (import-surface parity).
+- **`FASTERAPI_MAX_BODY`** env var tunes the Hyper body cap (16 MiB default).
+- GitHub Actions CI (test matrix 3.10–3.14 + lint + wheel builds on tags)
+  and a ruff advisory gate in `pre-commit`.
+- `tests/test_parity_extended.py`: 23 differential tests — multi-dep error
+  collection, required params, DI concurrency/cache/ordering, mounts,
+  on_event, route kwargs, enum/union/nested-model validation, route
+  ordering edge cases, rate limiter, JSON writer parity.
+
+### Fixed
+- **Required `Query`/`Header`/`Cookie` params** silently resolved to
+  `Ellipsis` (dead `param.default is empty` check) — now 422 correctly.
+- **Multi-dep 422s** collected only the first failing dep's errors —
+  now returns every failure in signature order like FastAPI.
+
+### Added (previous)
 - Rust Hyper + Tokio ASGI host spike (`serve_asgi`, `FASTERAPI_HYPER=1`,
   `python -m fasterapi run app:app --hyper`): sockets + HTTP parsing in Rust,
   byte-identical app behavior, lifespan, graceful SIGTERM/SIGINT shutdown,

@@ -137,7 +137,7 @@ pytest tests/ -q
 | SSE/docs-adjacent (`tests/test_parity_surface.py`) | 7 | all passing |
 | Export guard (`tests/test_exports.py`) | 3 | all passing |
 | Thread soak (`tests/test_threads.py`) | 3 | all passing |
-| **Total** | **58** | **64 passed** |
+| **Total** | **58** | **87 passed** |
 
 Coverage: ping, path/query/header/cookie params, validation shapes (422 `loc`/`type`/`ctx`, multi-error, malformed-JSON `json_invalid`), JSON body + `response_model` (+flags, return-annotation fallback), Form, file upload, DI order + `yield` teardown, `HTTPException`, custom handlers, router prefixes, OpenAPI shapes (full-spec equality, securitySchemes, webhooks), websockets (+auth), guards, DAG, Rust bridge, OAuth2/HTTP/API-key schemes, `Security`, password-grant forms, background tasks, datetime/UUID/Enum encoding, export surface, thread soak, Hyper host (file bytes, 413, middleware fallback, graceful lifespan, ws echo/auth).
 <!-- PARITY:END -->
@@ -288,15 +288,20 @@ Micro fast-paths (in-process, no servers):
 
 | Check | Baseline | fasterapi | Speedup |
 |---|---|---|---|
-| JSON `loads` | 0.0222s stdlib | 0.0377s SIMD | x0.59 |
-| JSON `dumps` | stdlib | Rust bridge | x0.95 |
-| Model validate (`loads`+`validate_python` vs `validate_json`) | 0.0024s | 0.0013s | x1.89 |
-| Model dump (`dump_python`+`dumps` vs `dump_json`) | 0.0032s | 0.0012s | x2.71 |
-| Router match | 0.1917s Python | 0.0603s `matchit` | x3.18 |
+| JSON `loads` | 0.0281s stdlib | 0.03s (delegates to stdlib — SIMD parse loses to CPython's fused scanner) | x0.94 |
+| JSON `dumps` | stdlib | Rust direct-writer | x2.44 |
+| Model validate (`loads`+`validate_python` vs `validate_json`) | 0.0028s | 0.0014s | x2.01 |
+| Model dump (`dump_python`+`dumps` vs `dump_json`) | 0.0036s | 0.0013s | x2.79 |
+| Router match | 0.1803s Python | 0.0662s `matchit` | x2.72 |
 
 Macro load (loopback, httpx concurrency; last full run):
 
-No full run yet — `python benchmarks/benchmark_differential.py --quick` writes `benchmark-results/differential-latest.json`, then re-run this script.
+Run: `2026-11-09`, host `hyper`, speedup **x0.864** (pre-push: micro strict 3x + macro wide band x0.80).
+
+| Server | RPS | p50 | p90 | p99 | RSS |
+|---|---|---|---|---|---|
+| fastapi+uvicorn | 569.8 | 25.295ms | 60.743ms | 104.967ms | 58.2MB |
+| fasterapi | 492.3 | 28.347ms | 80.605ms | 174.311ms | 52.9MB |
 <!-- BENCH:END -->
 
 Design rule going forward: **as much as possible in Rust,

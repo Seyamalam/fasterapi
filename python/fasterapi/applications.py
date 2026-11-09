@@ -42,6 +42,32 @@ from .types import DecoratedCallable as DecoratedCallable  # noqa: F401 (surface
 from .utils import generate_unique_id as generate_unique_id  # noqa: F401
 
 
+def _on_event_lifespan(router: Any) -> Callable[..., Any]:
+    """Lifespan running ``router.on_startup``/``on_shutdown`` handler lists.
+
+    Mirrors FastAPI's vendored ``_DefaultLifespan``: only installed when the
+    user passed no ``lifespan=`` (a custom lifespan bypasses on_event there
+    too). Sync handlers are called, async handlers awaited.
+    """
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def lifespan(_app: Any):
+        for handler in getattr(router, "on_startup", []):
+            res = handler()
+            if inspect.isawaitable(res):
+                await res
+        try:
+            yield None
+        finally:
+            for handler in getattr(router, "on_shutdown", []):
+                res = handler()
+                if inspect.isawaitable(res):
+                    await res
+
+    return lifespan
+
+
 class FastAPI(Starlette):
     """FastAPI-compatible ASGI application."""
 
@@ -67,6 +93,11 @@ class FastAPI(Starlette):
         **extra: Any,
     ) -> None:
         super().__init__(lifespan=lifespan, middleware=middleware)  # type: ignore[call-arg]
+        # Radix-tree fast path for route dispatch (matchit). Falls back to
+        # Starlette's linear scan for anything it cannot prove identical.
+        from ._fast_router import FastRouter
+
+        self.router = FastRouter(lifespan=lifespan, redirect_slashes=redirect_slashes)
         # Request lifetime stack first (innermost user middleware), exactly
         # like FastAPI: `yield` teardowns run after background tasks.
         from .middleware.asyncexitstack import AsyncExitStackMiddleware
@@ -88,6 +119,10 @@ class FastAPI(Starlette):
         self.default_response_class = default_response_class
         self.redirect_slashes = redirect_slashes
         self._router = APIRouter(dependencies=dependencies or [])
+        self.router.on_startup = self._router.on_startup  # type: ignore[attr-defined]
+        self.router.on_shutdown = self._router.on_shutdown  # type: ignore[attr-defined]
+        if lifespan is None:
+            self.router.lifespan_context = _on_event_lifespan(self.router)  # type: ignore[attr-defined]
         self._user_exception_handlers: dict[Any, Callable[..., Any]] = dict(exception_handlers or {})
         self._install_handler(StarletteHTTPException, http_exception_handler)
         self._install_handler(RequestValidationError, request_validation_exception_handler)
@@ -154,6 +189,9 @@ class FastAPI(Starlette):
             r = StarletteRoute(redirect_url, _oauth2_redirect, methods=["GET"], name="oauth2-redirect")
             r._fasterapi_owned = True  # type: ignore[attr-defined]
             self.router.routes.append(r)
+        compile_routes = getattr(self.router, "compile_fast_routes", None)
+        if compile_routes is not None:
+            compile_routes()
 
     # -- decorators (FastAPI signatures) --------------------------------------
     def add_api_route(self, path: str, endpoint: Callable[..., Any], **kw: Any) -> None:
@@ -207,8 +245,31 @@ class FastAPI(Starlette):
         self._router.include_router(router, **kw)
         self._sync_starlette_routes()
 
+    def on_event(self, event_type: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        """Deprecated ``@app.on_event("startup"|"shutdown")`` parity."""
+        import warnings
+
+        warnings.warn(
+            "on_event is deprecated, use lifespan event handlers instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self._router.on_event(event_type)
+
     # -- middleware / handlers -------------------------------------------------
     def add_middleware(self, middleware_class: Any, *args: Any, **kwargs: Any) -> None:  # type: ignore[override]
+        # RateLimiter: share one bucket app-wide so the Hyper host can check
+        # it at socket level (see serve()). Hoisting note: under FASTERAPI_HYPER
+        # the bucket admits/rejects before ANY Python middleware, so its
+        # effective position in the stack is outermost.
+        from .guards import RateLimiter
+
+        if middleware_class is RateLimiter and "bucket" not in kwargs:
+            if getattr(self, "_edge_bucket", None) is None:
+                per_second = kwargs.get("per_second", args[0] if len(args) > 0 else 100)
+                burst = kwargs.get("burst", args[1] if len(args) > 1 else None)
+                self._edge_bucket = _bridge.make_token_bucket(per_second, burst)
+            kwargs["bucket"] = self._edge_bucket
         super().add_middleware(middleware_class, *args, **kwargs)
 
     def exception_handler(self, exc_class: Any) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
@@ -261,15 +322,12 @@ class FastAPI(Starlette):
         """
         endpoints = [r.endpoint for r in self._router.routes]
         dag = compile_app_dag(endpoints)
-        router = _bridge.make_router()
-        for r in self._router.routes:
-            # matchit uses `{param}` syntax already; starlette `{param}` matches.
-            pattern = r.path
-            try:
-                if hasattr(router, "insert"):
-                    router.insert(pattern, f"{sorted(r.methods)[0]} {pattern}")
-            except Exception:
-                pass
+        # The live dispatch tree lives on FastRouter; rebuild so build() also
+        # double-checks every pattern inserted cleanly.
+        compile_routes = getattr(self.router, "compile_fast_routes", None)
+        if compile_routes is not None:
+            compile_routes()
+        router = getattr(self.router, "_fr_router", None) or _bridge.make_router()
         try:
             _bridge.fast_json_dumps({"warmup": True})
             _bridge.fast_json_loads('{"warmup":true}')
@@ -313,7 +371,8 @@ class FastAPI(Starlette):
             except Exception:
                 _prev_int = None
             try:
-                serve_asgi(self, host, port, workers)
+                serve_asgi(self, host, port, workers,
+                           getattr(self, "_edge_bucket", None))
             finally:
                 if _prev_int is not None:
                     try:

@@ -174,8 +174,8 @@ def render_bench(micro: dict, macro: dict | None, has_rust: bool) -> str:
         "",
         "| Check | Baseline | fasterapi | Speedup |",
         "|---|---|---|---|",
-        f"| JSON `loads` | {micro['json_std_load_s']}s stdlib | {micro['json_fast_load_s']}s SIMD | x{micro['json_loads_speedup']} |",
-        f"| JSON `dumps` | stdlib | Rust bridge | x{micro['json_dumps_speedup']} |",
+        f"| JSON `loads` | {micro['json_std_load_s']}s stdlib | {micro['json_fast_load_s']}s (delegates to stdlib — SIMD parse loses to CPython's fused scanner) | x{micro['json_loads_speedup']} |",
+        f"| JSON `dumps` | stdlib | Rust direct-writer | x{micro['json_dumps_speedup']} |",
         f"| Model validate (`loads`+`validate_python` vs `validate_json`) | "
         f"{micro['model_classic_s']}s | {micro['model_validate_json_s']}s | x{micro['model_validate_speedup']} |",
         f"| Model dump (`dump_python`+`dumps` vs `dump_json`) | "

@@ -19,6 +19,13 @@ echo "=== fasterapi pre-commit ($PY) ==="
 if command -v cargo >/dev/null 2>&1; then
   cargo fmt --check 2>/dev/null || echo "  (cargo fmt: differences found — run 'cargo fmt')"
 fi
+# Python lint: ruff when available (advisory until configured clean).
+if "$PY" -m ruff --version >/dev/null 2>&1; then
+  PYTHONPATH="$ROOT/python" "$PY" -m ruff check python/fasterapi tests benchmarks scripts \
+    || echo "  (ruff: findings — run '$PY -m ruff check python/')"
+elif command -v ruff >/dev/null 2>&1; then
+  ruff check python/fasterapi tests benchmarks scripts || true
+fi
 # Fast native unit tests only; full differential suite runs on pre-push.
 # Skip (advisory) when optional test deps aren't installed yet.
 if ! PYTHONPATH="$ROOT/python" "$PY" -c "import fastapi, starlette" 2>/dev/null; then

@@ -22,6 +22,8 @@ governor = "0.6"
 parking_lot = "0.12"
 regex = "1"
 percent-encoding = "2"
+itoa = "1"
+ryu = "1"
 # Hyper host spike (tasks: Rust owns sockets + HTTP parsing, Python runs the
 # ASGI app in-process). Minimal features only.
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time", "signal", "sync", "fs", "io-util", "io-std"] }

@@ -82,77 +82,181 @@ fn value_to_py(py: Python<'_>, v: &serde_json::Value) -> PyObject {
 
 fn write_json_str(buf: &mut String, s: &str) {
     buf.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => buf.push_str("\\\""),
-            '\\' => buf.push_str("\\\\"),
-            '\n' => buf.push_str("\\n"),
-            '\r' => buf.push_str("\\r"),
-            '\t' => buf.push_str("\\t"),
-            '\u{08}' => buf.push_str("\\b"),
-            '\u{0C}' => buf.push_str("\\f"),
-            c if (c as u32) < 0x20 => {
-                buf.push_str(&format!("\\u{:04x}", c as u32));
+    // Byte-wise scan: ASCII bytes pass through verbatim; only bytes needing
+    // an escape take the slow arm. Non-ASCII UTF-8 passes through raw, like
+    // `json.dumps(..., ensure_ascii=False)` — the bridge's contract.
+    let bytes = s.as_bytes();
+    let mut run_start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        let esc: Option<&'static str> = match b {
+            b'"' => Some("\\\""),
+            b'\\' => Some("\\\\"),
+            b'\n' => Some("\\n"),
+            b'\r' => Some("\\r"),
+            b'\t' => Some("\\t"),
+            0x08 => Some("\\b"),
+            0x0C => Some("\\f"),
+            0x00..=0x1F => None,
+            _ => {
+                i += 1;
+                continue;
             }
-            c => buf.push(c),
+        };
+        buf.push_str(&s[run_start..i]);
+        match esc {
+            Some(e) => buf.push_str(e),
+            None => {
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                buf.push_str("\\u00");
+                buf.push(HEX[(b >> 4) as usize] as char);
+                buf.push(HEX[(b & 0xF) as usize] as char);
+            }
         }
+        i += 1;
+        run_start = i;
     }
+    buf.push_str(&s[run_start..]);
     buf.push('"');
 }
 
-fn write_json_key(buf: &mut String, obj: &Bound<'_, PyAny>) -> PyResult<()> {
+fn write_json_key(buf: &mut String, obj: &Bound<'_, PyAny>, strict: bool) -> PyResult<()> {
     // Mirror CPython: str as-is, int/float/bool/None coerced, else TypeError.
     if let Ok(s) = obj.downcast::<PyString>() {
-        write_json_str(buf, &s.to_string());
+        write_json_str(buf, &s.to_string_lossy());
         return Ok(());
     }
-    if let Ok(b) = obj.downcast::<PyBool>() {
-        buf.push_str(if b.is_true() { "true" } else { "false" });
-        return Ok(());
-    }
-    if obj.is_none() {
-        buf.push_str("null");
-        return Ok(());
-    }
-    if let Ok(i) = obj.downcast::<PyInt>() {
-        if let Ok(iv) = i.extract::<i64>() {
-            buf.push_str(&iv.to_string());
+    // CPython coerces non-str keys into quoted strings: True→"true",
+    // None→"null", 1→"1", 1.5→"1.5". Everything below stays quoted.
+    buf.push('"');
+    let r = (|| -> PyResult<()> {
+        if let Ok(b) = obj.downcast::<PyBool>() {
+            buf.push_str(if b.is_true() { "true" } else { "false" });
             return Ok(());
         }
-        if let Ok(uv) = i.extract::<u64>() {
-            buf.push_str(&uv.to_string());
+        if obj.is_none() {
+            buf.push_str("null");
             return Ok(());
         }
-        let f: f64 = i.extract()?;
-        write_json_float(buf, f);
-        return Ok(());
-    }
-    if let Ok(f) = obj.downcast::<PyFloat>() {
-        write_json_float(buf, f.value());
-        return Ok(());
-    }
-    Err(pyo3::exceptions::PyTypeError::new_err(
-        "keys must be str, int, float, bool or None",
-    ))
+        if let Ok(i) = obj.downcast::<PyInt>() {
+            if let Ok(iv) = i.extract::<i64>() {
+                buf.push_str(itoa::Buffer::new().format(iv));
+                return Ok(());
+            }
+            if let Ok(uv) = i.extract::<u64>() {
+                buf.push_str(itoa::Buffer::new().format(uv));
+                return Ok(());
+            }
+            let f: f64 = i.extract()?;
+            write_json_float(buf, f, strict)?;
+            return Ok(());
+        }
+        if let Ok(f) = obj.downcast::<PyFloat>() {
+            write_json_float(buf, f.value(), strict)?;
+            return Ok(());
+        }
+        Err(pyo3::exceptions::PyTypeError::new_err(
+            "keys must be str, int, float, bool or None",
+        ))
+    })();
+    buf.push('"');
+    r
 }
 
-fn write_json_float(buf: &mut String, v: f64) {
-    if v.is_infinite() {
-        buf.push_str(if v.is_sign_positive() {
+/// Render `v` exactly like CPython `repr()`/`json.dumps`: ryu produces the
+/// shortest round-trip digits; we re-render them under Python's notation
+/// rule — scientific iff decpt > 16 or decpt <= -4, exponent always signed
+/// and at least two digits (where "decpt" is the power of ten of the first
+/// significant digit plus one, i.e. value = 0.digits × 10^decpt).
+fn write_json_float(buf: &mut String, v: f64, strict: bool) -> PyResult<()> {
+    if !v.is_finite() {
+        if strict {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "Out of range float values are not JSON compliant",
+            ));
+        }
+        buf.push_str(if v.is_nan() {
+            "NaN"
+        } else if v.is_sign_positive() {
             "Infinity"
         } else {
             "-Infinity"
         });
-    } else if v.is_nan() {
-        buf.push_str("NaN");
-    } else if v.fract() == 0.0 && v.abs() < 1e21 {
-        buf.push_str(&format!("{v:.1}"));
-    } else {
-        buf.push_str(&v.to_string());
+        return Ok(());
     }
+    let mut rbuf = ryu::Buffer::new();
+    let raw = rbuf.format_finite(v);
+    // raw grammar: [-]D[.D][e[-]D]
+    let (neg, raw) = match raw.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, raw),
+    };
+    let (mantissa, exp_str) = match raw.split_once(['e', 'E']) {
+        Some((m, e)) => (m, e),
+        None => (raw, "0"),
+    };
+    let exp: i32 = exp_str.parse().unwrap_or(0);
+    let (int_part, frac_part) = match mantissa.split_once('.') {
+        Some((a, b)) => (a, b),
+        None => (mantissa, ""),
+    };
+    // f64 has at most 17 significant digits; join int+frac on the stack.
+    let mut combined = [0u8; 32];
+    combined[..int_part.len()].copy_from_slice(int_part.as_bytes());
+    combined[int_part.len()..int_part.len() + frac_part.len()]
+        .copy_from_slice(frac_part.as_bytes());
+    let clen = int_part.len() + frac_part.len();
+    let lz = combined[..clen].iter().take_while(|&&b| b == b'0').count();
+    let digits = std::str::from_utf8(&combined[lz..clen]).unwrap_or("0");
+    if digits.is_empty() {
+        buf.push_str(if neg { "-0.0" } else { "0.0" });
+        return Ok(());
+    }
+    let decpt = int_part.len() as i32 - lz as i32 + exp;
+    if neg {
+        buf.push('-');
+    }
+    if decpt > 16 || decpt <= -4 {
+        // Scientific: d[.rest]e±XX (exponent = decpt-1, ≥2 digits).
+        buf.push_str(&digits[..1]);
+        if digits.len() > 1 {
+            buf.push('.');
+            buf.push_str(&digits[1..]);
+        }
+        let e = decpt - 1;
+        buf.push('e');
+        buf.push(if e < 0 { '-' } else { '+' });
+        let ae = e.unsigned_abs();
+        if ae < 10 {
+            buf.push('0');
+        }
+        buf.push_str(itoa::Buffer::new().format(ae));
+    } else if decpt <= 0 {
+        // 0.000ddd
+        buf.push_str("0.");
+        for _ in 0..(-decpt) {
+            buf.push('0');
+        }
+        buf.push_str(digits);
+    } else if (decpt as usize) >= digits.len() {
+        // ddd000.0
+        buf.push_str(digits);
+        for _ in 0..(decpt as usize - digits.len()) {
+            buf.push('0');
+        }
+        buf.push_str(".0");
+    } else {
+        // dd.ddd
+        let d = decpt as usize;
+        buf.push_str(&digits[..d]);
+        buf.push('.');
+        buf.push_str(&digits[d..]);
+    }
+    Ok(())
 }
 
-fn write_json_value(buf: &mut String, obj: &Bound<'_, PyAny>) -> PyResult<()> {
+fn write_json_value(buf: &mut String, obj: &Bound<'_, PyAny>, strict: bool) -> PyResult<()> {
     if obj.is_none() {
         buf.push_str("null");
         return Ok(());
@@ -162,24 +266,24 @@ fn write_json_value(buf: &mut String, obj: &Bound<'_, PyAny>) -> PyResult<()> {
         return Ok(());
     }
     if let Ok(s) = obj.downcast::<PyString>() {
-        write_json_str(buf, &s.to_string());
+        write_json_str(buf, &s.to_string_lossy());
         return Ok(());
     }
     if let Ok(i) = obj.downcast::<PyInt>() {
         if let Ok(iv) = i.extract::<i64>() {
-            buf.push_str(&iv.to_string());
+            buf.push_str(itoa::Buffer::new().format(iv));
             return Ok(());
         }
         if let Ok(uv) = i.extract::<u64>() {
-            buf.push_str(&uv.to_string());
+            buf.push_str(itoa::Buffer::new().format(uv));
             return Ok(());
         }
         let f: f64 = i.extract()?;
-        write_json_float(buf, f);
+        write_json_float(buf, f, strict)?;
         return Ok(());
     }
     if let Ok(f) = obj.downcast::<PyFloat>() {
-        write_json_float(buf, f.value());
+        write_json_float(buf, f.value(), strict)?;
         return Ok(());
     }
     if let Ok(list) = obj.downcast::<PyList>() {
@@ -190,7 +294,7 @@ fn write_json_value(buf: &mut String, obj: &Bound<'_, PyAny>) -> PyResult<()> {
                 buf.push(',');
             }
             first = false;
-            write_json_value(buf, &item)?;
+            write_json_value(buf, &item, strict)?;
         }
         buf.push(']');
         return Ok(());
@@ -203,7 +307,7 @@ fn write_json_value(buf: &mut String, obj: &Bound<'_, PyAny>) -> PyResult<()> {
                 buf.push(',');
             }
             first = false;
-            write_json_value(buf, &item)?;
+            write_json_value(buf, &item, strict)?;
         }
         buf.push(']');
         return Ok(());
@@ -216,9 +320,9 @@ fn write_json_value(buf: &mut String, obj: &Bound<'_, PyAny>) -> PyResult<()> {
                 buf.push(',');
             }
             first = false;
-            write_json_key(buf, &k)?;
+            write_json_key(buf, &k, strict)?;
             buf.push(':');
-            write_json_value(buf, &v)?;
+            write_json_value(buf, &v, strict)?;
         }
         buf.push('}');
         return Ok(());
@@ -270,10 +374,11 @@ fn fast_json_loads(py: Python<'_>, payload: &str) -> PyResult<PyObject> {
 /// Direct JSON serialize: walks Python objects straight into the output
 /// buffer (no intermediate `serde_json::Value`), mirroring stdlib semantics.
 #[pyfunction]
-fn fast_json_dumps(py: Python<'_>, obj: PyObject) -> PyResult<String> {
+#[pyo3(signature = (obj, strict = false))]
+fn fast_json_dumps(py: Python<'_>, obj: PyObject, strict: bool) -> PyResult<String> {
     let bound = obj.bind(py);
     let mut buf = String::with_capacity(128);
-    write_json_value(&mut buf, bound)?;
+    write_json_value(&mut buf, bound, strict)?;
     Ok(buf)
 }
 
@@ -397,19 +502,21 @@ impl RustRouter {
 // Token-bucket rate limiting (governor)
 // ---------------------------------------------------------------------------
 
+/// Shared handle: the limiter behind `TokenBucket`, clonable into the Hyper
+/// accept loop for zero-GIL checks before any Python code runs.
+type GovLimiter = governor::RateLimiter<
+    governor::state::NotKeyed,
+    governor::state::InMemoryState,
+    governor::clock::DefaultClock,
+>;
+
 /// Thread-safe token-bucket guard executed at the socket level in Rust.
 ///
 /// Python configures it via `Guards` / `RateLimiter`; the Hyper host calls
 /// `check()` before any Python runs. Returns `True` when admitted.
 #[pyclass]
 struct TokenBucket {
-    limiter: Arc<
-        governor::RateLimiter<
-            governor::state::NotKeyed,
-            governor::state::InMemoryState,
-            governor::clock::DefaultClock,
-        >,
-    >,
+    limiter: Arc<GovLimiter>,
     per_second: f64,
 }
 
@@ -911,6 +1018,19 @@ fn boxed_full(bytes: Bytes) -> RespBody {
 }
 
 const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+/// Request body cap, tunable via `FASTERAPI_MAX_BODY` (bytes). Cached after
+/// first read so request handling stays allocation-free.
+fn max_body_bytes() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("FASTERAPI_MAX_BODY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(MAX_BODY_BYTES)
+    })
+}
 /// Per-worker queue depth: backpressure overflows to `spawn_blocking`.
 const POOL_QUEUE: usize = 64;
 
@@ -1027,7 +1147,21 @@ async fn serve_one(
     pool: &PyWorkerPool,
     app: PyObject,
     req: Request<hyper::body::Incoming>,
+    rate_limit: Option<Arc<GovLimiter>>,
 ) -> Result<Response<RespBody>, hyper::Error> {
+    // Socket-level rate limit: rejected before body collection, websockets,
+    // and any Python. Body matches the RateLimiter middleware's 429.
+    if let Some(lim) = &rate_limit {
+        if lim.check().is_err() {
+            return Ok(Response::builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .header("content-type", "application/json")
+                .body(boxed_full(Bytes::from_static(
+                    br#"{"detail":"Rate limit exceeded"}"#,
+                )))
+                .unwrap());
+        }
+    }
     // Websocket upgrade? Must precede body collection (upgrades carry none).
     if req.method() == hyper::Method::GET && is_ws_upgrade(req.headers()) {
         return serve_ws(app, req).await;
@@ -1046,7 +1180,7 @@ async fn serve_one(
     }
     let collected = req.collect().await?;
     let body = collected.to_bytes();
-    if body.len() > MAX_BODY_BYTES {
+    if body.len() > max_body_bytes() {
         let resp = Response::builder()
             .status(StatusCode::PAYLOAD_TOO_LARGE)
             .body(boxed_full(Bytes::from_static(b"Request body too large")))
@@ -1561,15 +1695,18 @@ fn py_ws_close_session(sid: String) {
 
 /// Serve an ASGI app over Hyper + Tokio. Blocks until Ctrl-C (SIGINT).
 ///
-/// `workers=None` uses Tokio's default (one worker per CPU).
+/// `workers=None` uses Tokio's default (one worker per CPU). `bucket` is an
+/// optional `TokenBucket` whose limiter is checked at socket level — before
+/// any Python code runs — returning `429` on rejection.
 #[pyfunction]
-#[pyo3(signature = (app, host="127.0.0.1", port=8000, workers=None))]
+#[pyo3(signature = (app, host="127.0.0.1", port=8000, workers=None, bucket=None))]
 fn serve_asgi(
     py: Python<'_>,
     app: PyObject,
     host: &str,
     port: u16,
     workers: Option<usize>,
+    bucket: Option<Py<TokenBucket>>,
 ) -> PyResult<()> {
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.enable_all().thread_name("fasterapi-hyper");
@@ -1590,8 +1727,12 @@ fn serve_asgi(
                 .unwrap_or(4)
         });
     let pool = std::sync::Arc::new(PyWorkerPool::new(pool_size));
-    py.allow_threads(|| run_until_ctrl_c(rt, app, host.to_string(), port, pool))
-        .map_err(py_runtime_error)
+    // Clone the shared limiter Arc — every request check is GIL-free.
+    let rate_limit = bucket.map(|b| b.borrow(py).limiter.clone());
+    py.allow_threads(|| {
+        run_until_ctrl_c(rt, app, host.to_string(), port, pool, rate_limit)
+    })
+    .map_err(py_runtime_error)
 }
 
 fn run_until_ctrl_c(
@@ -1600,6 +1741,7 @@ fn run_until_ctrl_c(
     host: String,
     port: u16,
     pool: std::sync::Arc<PyWorkerPool>,
+    rate_limit: Option<Arc<GovLimiter>>,
 ) -> Result<(), String> {
     rt.block_on(async move {
         run_lifespan(&app, "startup")?;
@@ -1621,13 +1763,15 @@ fn run_until_ctrl_c(
                     // Brief GIL grab per connection for the refcount bump.
                     let app_ref = Python::with_gil(|py| app.clone_ref(py));
                     let pool = pool.clone();
+                    let rate_limit = rate_limit.clone();
                     let in_flight = in_flight.clone();
                     in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     tokio::spawn(async move {
                         let svc = service_fn(move |req| {
                             let app_ref = Python::with_gil(|py| app_ref.clone_ref(py));
                             let pool = pool.clone();
-                            async move { serve_one(&pool, app_ref, req).await }
+                            let rate_limit = rate_limit.clone();
+                            async move { serve_one(&pool, app_ref, req, rate_limit).await }
                         });
                         // with_upgrades is REQUIRED: without it, upgrade::on()
                         // can never resolve ("low level API in use").

@@ -199,6 +199,8 @@ def get_openapi(
     for route in routes:
         if getattr(route, "endpoint", None) is None:
             continue
+        if getattr(route, "include_in_schema", True) is False:
+            continue
         rpath = openapi_prefix + getattr(route, "path", "/")
         item = paths.setdefault(rpath, {})
         path_item, schemas, schemes = get_openapi_path(
@@ -408,7 +410,30 @@ def get_openapi_path(
             "description": "Validation Error",
             "content": {"application/json": {"schema": {"$ref": "#/components/schemas/HTTPValidationError"}}},
         }
+    # Route-declared extra responses merge over the generated set.
+    for status_key, extra_resp in (getattr(route, "responses", None) or {}).items():
+        responses[str(status_key)] = extra_resp
     op["responses"] = responses
+    # `callbacks=` (list of APIRouter) → OpenAPI callbacks object, keyed by
+    # callback route name like FastAPI.
+    route_callbacks = getattr(route, "callbacks", None) or []
+    if route_callbacks:
+        cb_spec: dict[str, Any] = {}
+        for cb_router in route_callbacks:
+            for cb_route in getattr(cb_router, "routes", []):
+                cb_item, cb_schemas, cb_schemes = get_openapi_path(
+                    route=cb_route, operation_ids=operation_ids)
+                for key, value in cb_schemas.items():
+                    components.setdefault(key, value)
+                for key, value in cb_schemes.items():
+                    security_schemes.setdefault(key, value)
+                name = getattr(cb_route, "name", None) or getattr(
+                    getattr(cb_route, "endpoint", None), "__name__", "callback")
+                cb_spec.setdefault(name, {}).update(cb_item)
+        if cb_spec:
+            op["callbacks"] = cb_spec
+    if getattr(route, "openapi_extra", None):
+        op.update(route.openapi_extra)
     # Security: schemes referenced by Depends()/Security() on the endpoint
     # or the route produce components + per-operation requirements.
     op_security = _route_security(route, endpoint, security_schemes)
