@@ -32,6 +32,9 @@ are `0.x` until the Hyper host promotes to default.
   on `include_router` (deprecation-warned, matches FastAPI semantics).
 - **`fasterapi.openapi.webhooks`** module (import-surface parity).
 - **`FASTERAPI_MAX_BODY`** env var tunes the Hyper body cap (16 MiB default).
+- **Free-threaded support**: the extension declares `gil_used = false`
+  (PyO3 nogil-safe) — the full 87-test suite passes under `PYTHON_GIL=0`
+  on CPython 3.14t.
 - **True streaming on Hyper**: responses that keep producing past a 30ms
   settle graduate to a real-time session — chunks flow through an mpsc into
   Hyper's body writer (chunked encoding), the client sees incremental bytes,

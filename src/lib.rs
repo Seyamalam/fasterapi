@@ -1903,7 +1903,7 @@ fn run_until_ctrl_c(
 // ---------------------------------------------------------------------------
 
 /// Native `_fasterapi_rs` extension module.
-#[pymodule]
+#[pymodule(gil_used = false)]
 fn _fasterapi_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", VERSION)?;
     m.add_function(wrap_pyfunction!(fast_json_loads, m)?)?;
