@@ -3,8 +3,14 @@
 Rust (`serve_asgi`) owns sockets + HTTP parsing and calls in here:
 
 * ``run_lifespan(app, kind)`` — drives Starlette lifespan around serving,
-* ``run_request(...)`` — drives ``app(scope, receive, send)`` for one
-  request on a thread-local asyncio loop, returns ``(status, headers, body)``,
+* ``run_scoped(app, scope, request_msg, sendfile_ok)`` — drives
+  ``app(scope, receive, send)`` for one request on a thread-local asyncio
+  loop, returns ``(status, headers, body, session|None)``. Rust builds the
+  scope natively, so each request is a single GIL crossing. Graduated
+  streaming responses return a ``_StreamSession`` that Rust registers and
+  drives via ``drive``/``drain``/``close``.
+* ``run_request(app, method, path, qs, headers, body)`` — same engine with
+  the scope built in Python (tests + out-of-band drivers).
 * ``ws_open`` / ``ws_step`` / ``ws_close`` — websocket sessions: the ASGI
   app runs on a per-session loop, Rust does framing + the 101 handshake.
 
@@ -18,8 +24,13 @@ from __future__ import annotations
 import asyncio
 import threading
 import traceback
+from collections import deque
 from typing import Any, Optional
 from urllib.parse import unquote
+
+from starlette.middleware.errors import ServerErrorMiddleware
+from starlette.middleware.exceptions import ExceptionMiddleware
+from starlette.routing import Match, get_route_path
 
 _LIFESPAN_CM: Any = None
 _LIFESPAN_LOOP: Any = None
@@ -29,19 +40,55 @@ _WS_SESSIONS: dict[str, dict[str, Any]] = {}
 _WS_LOCK = threading.Lock()
 _WS_TIMEOUT = 30.0
 
+_AES_CLS: Any = None
+
+
+class _NoPollSelector:
+    """Selector shim: ``select(timeout=0)`` never pays the syscall.
+
+    ``_run_once`` calls ``select(0)`` whenever the ready queue is non-empty —
+    on macOS each ``kqueue.control`` call costs ~10µs even with zero fds, and
+    the bridge pumps the loop several times per request. A zero-timeout poll
+    can only report fds that stay registered for the next real wait, so
+    returning empty just defers them one iteration. This loop registers no
+    fds at all, so the shortcut is exact.
+    """
+
+    __slots__ = ("_sel",)
+
+    def __init__(self, sel: Any) -> None:
+        self._sel = sel
+
+    def select(self, timeout: Optional[float] = None) -> Any:
+        if timeout == 0:
+            return ()
+        return self._sel.select(timeout)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._sel, name)
+
 
 def _direct_ok(app: Any) -> bool:
     """Direct dispatch is valid only with zero user middleware.
 
     Skipping Starlette's ServerError/Exception wrappers + router loop is
     byte-identical only when no user middleware could observe or alter the
-    exchange. The check is a tiny isinstance scan (no cache → always fresh
-    if the app gains middleware later).
+    exchange. Cached per app keyed on (id, len) of user_middleware — the
+    fingerprint changes if middleware is appended post-build, so the check
+    re-runs instead of going stale.
     """
+    global _AES_CLS
     try:
-        from .middleware.asyncexitstack import AsyncExitStackMiddleware
-
         middlewares = getattr(app, "user_middleware", None) or []
+        fp = (id(middlewares), len(middlewares))
+        cached = getattr(app, "_hyper_direct", None)
+        if cached is not None and cached[0] == fp:
+            return cached[1]
+        if _AES_CLS is None:
+            from .middleware.asyncexitstack import AsyncExitStackMiddleware
+
+            _AES_CLS = AsyncExitStackMiddleware
+        ok = True
         for entry in middlewares:
             cls = getattr(entry, "cls", None)
             if cls is None:
@@ -51,10 +98,16 @@ def _direct_ok(app: Any) -> bool:
                     try:
                         cls = tuple(entry)[0]
                     except (IndexError, TypeError):
-                        return False
-            if cls is not AsyncExitStackMiddleware:
-                return False
-        return True
+                        ok = False
+                        break
+            if cls is not _AES_CLS:
+                ok = False
+                break
+        try:
+            app._hyper_direct = (fp, ok)
+        except Exception:
+            pass
+        return ok
     except Exception:
         return False
 
@@ -69,6 +122,9 @@ def _get_loop() -> asyncio.AbstractEventLoop:
     loop = getattr(_tls, "loop", None)
     if loop is None or loop.is_closed():
         loop = asyncio.new_event_loop()
+        sel = getattr(loop, "_selector", None)  # ProactorEventLoop has none.
+        if sel is not None:
+            loop._selector = _NoPollSelector(sel)  # type: ignore[attr-defined]
         asyncio.set_event_loop(loop)
         _tls.loop = loop
     return loop
@@ -105,8 +161,9 @@ def run_request(
     headers: list[tuple[str, bytes]],
     body: bytes,
     sendfile_ok: bool = True,
-) -> tuple[int, list[tuple[str, str]], bytes]:
-    """Drive one ASGI request to completion; return ``(status, headers, body)``."""
+) -> tuple[int, list[tuple[str, str]], bytes, Any]:
+    """Compat entrypoint (tests + out-of-band drivers): builds the scope in
+    Python, then runs the same engine Rust calls as ``run_scoped``."""
     raw_headers = [(name.lower().encode("latin-1"), bytes(value)) for name, value in headers]
     scope = {
         "type": "http",
@@ -123,35 +180,102 @@ def run_request(
         "server": ("fasterapi-hyper", 0),
         "extensions": {},
     }
-    pending: list[dict[str, Any]] = [{"type": "http.request", "body": bytes(body), "more_body": False}]
+    request_msg = {"type": "http.request", "body": bytes(body), "more_body": False}
+    return run_scoped(app, scope, request_msg, sendfile_ok)
+
+
+def _match_route(router: Any, scope: dict[str, Any]) -> tuple[Any, Optional[dict[str, Any]]]:
+    """Find the FULL-match route for ``scope``.
+
+    Radix fast path mirroring ``FastRouter.app`` (same ambiguity rules); any
+    shape the tree can't prove falls back to the linear ``route.matches``
+    scan, and unmatched returns ``(None, None)`` so the caller can run the
+    full stack (404/405/redirects stay byte-identical).
+    """
+    fr = getattr(router, "_fr_router", None)
+    if fr is not None:
+        ensure = getattr(router, "_ensure_compiled", None)
+        if ensure is not None:
+            ensure()
+            fr = router._fr_router
+    if fr is not None:
+        hit = fr.match(get_route_path(scope))
+        if hit is not None:
+            idx, params = hit
+            idx = int(idx)
+            if idx not in router._fr_ambiguous and idx < router._fr_first_skip:
+                for j in (idx, *router._fr_multi.get(idx, ())):
+                    cand = router.routes[j]
+                    if not cand.methods or scope["method"] in cand.methods:
+                        return cand, {
+                            "route": cand,
+                            "endpoint": getattr(cand, "endpoint", None),
+                            "path_params": {**scope.get("path_params", {}), **params},
+                        }
+                return None, None
+    for route in router.routes:
+        matches = getattr(route, "matches", None)
+        if matches is None:
+            continue
+        try:
+            match, child_scope = matches(scope)
+        except Exception:
+            continue
+        if match == Match.FULL:
+            return route, child_scope
+    return None, None
+
+
+def run_scoped(
+    app: Any,
+    scope: dict[str, Any],
+    request_msg: dict[str, Any],
+    sendfile_ok: bool = True,
+) -> tuple[int, list[tuple[str, str]], bytes, Any]:
+    """Drive one ASGI request; ``(status, headers, body, session|None)``.
+
+    The Rust host builds ``scope`` + ``request_msg`` natively and calls this
+    once per request — a single GIL crossing that returns the whole result.
+
+    Pump strategy: ``loop.run_forever()`` exits when the app task completes
+    or the settle timer fires — byte-identical to the old
+    ``asyncio.wait(task, timeout)`` window, but a typical request completes
+    in ~2 ``_run_once`` passes and, with ``_NoPollSelector``, zero select()
+    syscalls (sends never yield, so the whole app runs in one task step).
+    """
+    pending: deque = deque([request_msg])
+    out: deque = deque()
     sent: dict[str, Any] = {}
-    out_q: asyncio.Queue = asyncio.Queue()
+    # Cross-thread signal for session drain(); set on every send().
+    produced = threading.Event()
     # ASGI: after the request body, receive() pends until disconnect — never
     # return an eager disconnect (StreamingResponse's watcher would cancel
-    # the response after the first chunk). Set by stream_close on real
+    # the response after the first chunk). Set by close() on real
     # client disconnect.
     disconnect = asyncio.Event()
+    loop = _get_loop()
 
     async def receive() -> dict[str, Any]:
         if pending:
-            return pending.pop(0)
+            return pending.popleft()
         await disconnect.wait()
         return {"type": "http.disconnect"}
 
     async def send(message: dict[str, Any]) -> None:
-        await out_q.put(message)
+        # deque.append never yields: a response sends its whole envelope
+        # inside a single task step.
+        out.append(message)
+        produced.set()
 
     def _collect() -> None:
-        while True:
-            try:
-                message = out_q.get_nowait()
-            except asyncio.QueueEmpty:
-                return
+        while out:
+            message = out.popleft()
             mtype = message.get("type")
             if mtype == "http.response.start":
                 sent["status"] = int(message.get("status", 500))
                 sent["headers"] = [
-                    (k.decode("latin-1"), v.decode("latin-1")) for k, v in message.get("headers", [])
+                    (k.decode("latin-1"), v.decode("latin-1"))
+                    for k, v in message.get("headers", [])
                 ]
             elif mtype == "http.response.body":
                 sent.setdefault("chunks", []).append(bytes(message.get("body", b"")))
@@ -160,65 +284,55 @@ def run_request(
 
     async def _go() -> None:
         if _direct_ok(app):
-            # Fast lane: match via Starlette's own compiled matchers, then run
-            # the matched route app directly — no ServerError/Exception
-            # wrappers, no router loop. Anything unmatched (404/405/redirects)
-            # falls through to the full stack for exact handling.
-            from starlette.routing import Match
-
-            router = app.router
-            for route in router.routes:
-                matches = getattr(route, "matches", None)
-                if matches is None:
-                    continue
-                try:
-                    match, child_scope = matches(scope)
-                except Exception:
-                    continue
-                if match == Match.FULL:
-                    scope.update(child_scope)
-                    scope["app"] = app
-                    endpoint = getattr(route, "endpoint", None)
-                    if endpoint is not None:
-                        scope["endpoint"] = endpoint
-                    # Restore the exception wrappers skipped with Starlette's
-                    # normal app stack while avoiding its router scan.
-                    from starlette.middleware.errors import ServerErrorMiddleware
-                    from starlette.middleware.exceptions import ExceptionMiddleware
-
-                    handlers = getattr(app, "exception_handlers", {})
-                    exception_handlers = {
-                        key: value
-                        for key, value in handlers.items()
-                        if not isinstance(key, int) and key is not Exception
-                    }
-                    server_error_handler = None
-                    for key, handler in handlers.items():
-                        if key in (500, Exception):
-                            server_error_handler = handler
-                    wrapped = ExceptionMiddleware(
-                        route.app,
-                        handlers=exception_handlers,
-                        debug=bool(getattr(app, "debug", False)),
-                    )
-                    wrapped = ServerErrorMiddleware(
-                        wrapped,
-                        handler=server_error_handler,
-                        debug=bool(getattr(app, "debug", False)),
-                    )
-                    await wrapped(scope, receive, send)
-                    return
+            # Fast lane: match the route, then run its app inside the
+            # exception wrappers Starlette's normal stack provides. Anything
+            # unmatched (404/405/redirects) falls through to the full stack.
+            route, child_scope = _match_route(app.router, scope)
+            if route is not None:
+                scope.update(child_scope)
+                scope["app"] = app
+                endpoint = getattr(route, "endpoint", None)
+                if endpoint is not None:
+                    scope["endpoint"] = endpoint
+                handlers = getattr(app, "exception_handlers", {})
+                exception_handlers = {
+                    key: value
+                    for key, value in handlers.items()
+                    if not isinstance(key, int) and key is not Exception
+                }
+                server_error_handler = None
+                for key, handler in handlers.items():
+                    if key in (500, Exception):
+                        server_error_handler = handler
+                wrapped = ExceptionMiddleware(
+                    route.app,
+                    handlers=exception_handlers,
+                    debug=bool(getattr(app, "debug", False)),
+                )
+                wrapped = ServerErrorMiddleware(
+                    wrapped,
+                    handler=server_error_handler,
+                    debug=bool(getattr(app, "debug", False)),
+                )
+                await wrapped(scope, receive, send)
+                return
         await app(scope, receive, send)
 
-    loop = _get_loop()
     task = loop.create_task(_go())
+    task.add_done_callback(lambda _t: loop.stop())
     try:
         while True:
             # Drive the app for a settle window. Fast requests finish inside
             # it (zero overhead vs before); a response that started streaming
             # (`http.response.start` + a chunk with `more_body`) and is still
-            # producing graduates to the session path — real chunks, real-time.
-            loop.run_until_complete(asyncio.wait({task}, timeout=_STREAM_SETTLE_S))
+            # producing when the window expires graduates to the session
+            # path — real chunks, real-time. The pump exits on task done,
+            # the settle timer, or a stray stop from a prior request.
+            timer = loop.call_later(_STREAM_SETTLE_S, loop.stop)
+            try:
+                loop.run_forever()
+            finally:
+                timer.cancel()
             _collect()
             if task.done():
                 exc = task.exception()
@@ -237,117 +351,85 @@ def run_request(
                 k.lower() == "x-fasterapi-sendfile" for k, _ in sent.get("headers", [])
             )
             if "status" in sent and sent.get("stream") and not sendfile:
-                import secrets as _secrets
-
-                sid = _secrets.token_hex(8)
-                with _STREAM_LOCK:
-                    _STREAM_SESSIONS[sid] = {
-                        "loop": loop, "task": task, "out": out_q,
-                        "disconnect": disconnect,
-                    }
-                return (sent.get("status", 200), sent.get("headers", []),
-                        b"".join(sent.get("chunks", [])), sid)
+                return (
+                    sent.get("status", 200),
+                    sent.get("headers", []),
+                    b"".join(sent.get("chunks", [])),
+                    _StreamSession(loop, task, out, disconnect, produced),
+                )
     except Exception:
         if "status" not in sent:
             traceback.print_exc()
             raise
         traceback.print_exc()
-    return sent.get("status", 500), sent.get("headers", []), b"".join(sent.get("chunks", [])), ""
+    return sent.get("status", 500), sent.get("headers", []), b"".join(sent.get("chunks", [])), None
 
 
-_STREAM_SESSIONS: dict[str, dict[str, Any]] = {}
-_STREAM_LOCK = threading.Lock()
 # How long a response may produce before it's treated as streaming.
 _STREAM_SETTLE_S = 0.03
 
 
-def stream_drive(sid: str) -> None:
-    """Park the calling worker: drive the session loop until stream_close.
+class _StreamSession:
+    """One graduated streaming response; Rust owns the registry + sid.
 
-    Called by the Rust worker AFTER the reply (status/headers/sid) has been
-    handed back — the loop must run forever for stream_step's
-    run_coroutine_threadsafe calls to execute.
+    ``drive`` (called by the worker that produced the session) runs the loop
+    forever so the app task keeps producing. ``drain`` runs on a *different*
+    Rust worker and blocks on ``produced`` (a threading.Event — the wait
+    releases the GIL inside CPython). ``close`` stops both.
     """
-    with _STREAM_LOCK:
-        session = _STREAM_SESSIONS.get(sid)
-    if session is None:
-        return
-    try:
-        session["loop"].run_forever()
-    except Exception:
-        pass
 
+    __slots__ = ("loop", "task", "out", "disconnect", "produced")
 
-def stream_step(sid: str, wait_secs: float = 1.0) -> tuple[list[bytes], bool]:
-    """Drain pending body chunks; ``(chunks, done)``.
+    def __init__(self, loop: Any, task: Any, out: Any, disconnect: Any, produced: Any) -> None:
+        self.loop = loop
+        self.task = task
+        self.out = out
+        self.disconnect = disconnect
+        self.produced = produced
 
-    Blocks up to ``wait_secs`` for the next chunk (Rust keeps the socket
-    write loop in spawn_blocking). A client disconnect makes Rust stop
-    calling and invoke ``stream_close``.
-    """
-    with _STREAM_LOCK:
-        session = _STREAM_SESSIONS.get(sid)
-    if session is None:
-        return [], True
-    loop, out_q, task = session["loop"], session["out"], session["task"]
-
-    async def _drain() -> list[dict[str, Any]]:
-        msgs: list[dict[str, Any]] = []
+    def drive(self) -> None:
         try:
-            first = await asyncio.wait_for(out_q.get(), timeout=wait_secs)
-        except asyncio.TimeoutError:
-            first = None
-        if first is not None:
-            msgs.append(first)
-        while True:
-            try:
-                msgs.append(out_q.get_nowait())
-            except asyncio.QueueEmpty:
-                break
-        return msgs
-
-    try:
-        msgs = asyncio.run_coroutine_threadsafe(_drain(), loop).result(wait_secs + 5.0)
-    except Exception:
-        return [], True
-    chunks: list[bytes] = []
-    done = task.done()
-    for m in msgs:
-        if m.get("type") == "http.response.body":
-            b = m.get("body", b"")
-            if b:
-                chunks.append(bytes(b))
-            if not m.get("more_body"):
-                done = True
-        elif m.get("type") == "http.response.start":
+            self.loop.run_forever()
+        except Exception:
             pass
-    if done:
-        stream_close(sid)
-    return chunks, done
 
+    def drain(self, wait_secs: float = 1.0) -> tuple[list[bytes], bool]:
+        """Wait up to ``wait_secs`` for the next chunk; ``(chunks, done)``."""
+        out = self.out
+        if not out:
+            # Clear-then-recheck ordering means a send racing the clear is
+            # caught either by the queue check or by the still-set flag.
+            self.produced.clear()
+            if not out:
+                self.produced.wait(wait_secs)
+        chunks: list[bytes] = []
+        done = self.task.done()
+        while out:
+            message = out.popleft()
+            if message.get("type") == "http.response.body":
+                b = message.get("body", b"")
+                if b:
+                    chunks.append(bytes(b))
+                if not message.get("more_body"):
+                    done = True
+        return chunks, done
 
-def stream_close(sid: str) -> None:
-    """Tear down a stream session: cancel the app task, stop the loop."""
-    with _STREAM_LOCK:
-        session = _STREAM_SESSIONS.pop(sid, None)
-    if session is None:
-        return
-    loop, task = session["loop"], session["task"]
-    disconnect = session.get("disconnect")
+    def close(self) -> None:
+        """Tear down the session: cancel the app task, stop the loop."""
+        loop, task, disconnect = self.loop, self.task, self.disconnect
 
-    def _stop() -> None:
-        try:
-            if disconnect is not None:
+        def _stop() -> None:
+            try:
                 disconnect.set()
-            if not task.done():
-                task.cancel()
-        finally:
-            loop.stop()
+                if not task.done():
+                    task.cancel()
+            finally:
+                loop.stop()
 
-    try:
-        loop.call_soon_threadsafe(_stop)
-    except Exception:
-        pass
+        try:
+            loop.call_soon_threadsafe(_stop)
+        except Exception:
+            pass
 
 
 def hyper_available() -> bool:

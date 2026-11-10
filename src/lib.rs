@@ -1040,7 +1040,8 @@ fn py_runtime_error(msg: impl ToString) -> pyo3::PyErr {
 
 /// One Python job: everything needed to drive a single ASGI request.
 struct PyJob {
-    app: PyObject,
+    /// Shared ref to the app — `Arc` clones never touch the GIL.
+    app: Arc<PyObject>,
     method: String,
     path: String,
     query: String,
@@ -1049,52 +1050,193 @@ struct PyJob {
     /// False when the request had a `Range` header (sendfile skipped so
     /// partial-content semantics stay exactly Starlette's).
     sendfile_ok: bool,
-    reply: tokio::sync::oneshot::Sender<Result<(u16, Vec<(String, String)>, Vec<u8>, String), String>>,
+    reply: tokio::sync::oneshot::Sender<
+        Result<(u16, Vec<(String, String)>, Vec<u8>, u64), String>,
+    >,
+}
+
+/// Bridge callables resolved once per process — a per-request
+/// `import`+`getattr` pair is a dict round-trip we never need to repeat.
+struct PyBridge {
+    run_scoped: PyObject,
+    ws_open: PyObject,
+    ws_step: PyObject,
+    ws_close: PyObject,
+}
+
+static BRIDGE: std::sync::OnceLock<PyBridge> = std::sync::OnceLock::new();
+
+fn py_bridge(py: Python<'_>) -> Result<&'static PyBridge, String> {
+    if let Some(b) = BRIDGE.get() {
+        return Ok(b);
+    }
+    let helper = py
+        .import("fasterapi._hyper_serve")
+        .map_err(|e| e.to_string())?;
+    let get = |name: &str| -> Result<PyObject, String> {
+        helper
+            .getattr(name)
+            .map(|f| f.unbind())
+            .map_err(|e| e.to_string())
+    };
+    let bridge = PyBridge {
+        run_scoped: get("run_scoped")?,
+        ws_open: get("ws_open")?,
+        ws_step: get("ws_step")?,
+        ws_close: get("ws_close")?,
+    };
+    // Another worker may have won the race; entries are equivalent.
+    let _ = BRIDGE.set(bridge);
+    Ok(BRIDGE.get().expect("bridge just initialized"))
+}
+
+/// Streaming sessions live in Rust: Python hands back one opaque session
+/// object (with `drain`/`close`/`drive` methods); we key it by a u64 sid so
+/// step/close calls never build strings or touch a Python registry.
+fn stream_sessions() -> &'static RwLock<HashMap<u64, Arc<PyObject>>> {
+    static SESSIONS: std::sync::OnceLock<RwLock<HashMap<u64, Arc<PyObject>>>> =
+        std::sync::OnceLock::new();
+    SESSIONS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+static NEXT_SID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn register_stream(sess: PyObject) -> u64 {
+    let sid = NEXT_SID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    stream_sessions().write().insert(sid, Arc::new(sess));
+    sid
+}
+
+fn stream_session(sid: u64) -> Option<Arc<PyObject>> {
+    stream_sessions().read().get(&sid).cloned()
+}
+
+/// `stream_step`: wait for + drain one batch of session chunks.
+fn stream_step_rust(sid: u64, wait_secs: f64) -> Result<(Vec<Vec<u8>>, bool), String> {
+    match stream_session(sid) {
+        None => Ok((Vec::new(), true)),
+        Some(sess) => Python::with_gil(|py| {
+            // `drain` blocks on a threading.Event internally — CPython
+            // releases the GIL while parked, so this never starves the
+            // session's loop thread.
+            sess.bind(py)
+                .call_method1("drain", (wait_secs,))
+                .and_then(|r| r.extract::<(Vec<Vec<u8>>, bool)>())
+                .map_err(|e| e.to_string())
+        }),
+    }
+}
+
+/// `stream_close`: cancel the app task and stop the session loop.
+fn stream_close_rust(sid: u64) {
+    let sess = stream_sessions().write().remove(&sid);
+    if let Some(s) = sess {
+        let _ = Python::with_gil(|py| s.bind(py).call_method0("close").map(|_| ()));
+    }
+}
+
+/// `str.encode("ascii", "replace")` — one `?` per non-ASCII *char*.
+fn ascii_replace(s: &str) -> Vec<u8> {
+    s.chars()
+        .map(|c| if c.is_ascii() { c as u8 } else { b'?' })
+        .collect()
+}
+
+/// Build the ASGI scope dict natively — the Python side used to spend
+/// several µs on `unquote`/`.encode`/dict literals per request.
+fn build_http_scope<'py>(
+    py: Python<'py>,
+    job: &PyJob,
+) -> Result<Bound<'py, PyDict>, String> {
+    use pyo3::types::PyBytes;
+    let scope = PyDict::new(py);
+    let set = |k: &str, v: Bound<'py, PyAny>| -> Result<(), String> {
+        scope.set_item(k, v).map_err(|e| e.to_string())
+    };
+    let intern = |v: &str| PyString::new(py, v).into_any();
+    set("type", intern("http"))?;
+    let asgi = PyDict::new(py);
+    asgi.set_item("version", "3.0").map_err(|e| e.to_string())?;
+    asgi
+        .set_item("spec_version", "2.3")
+        .map_err(|e| e.to_string())?;
+    set("asgi", asgi.into_any())?;
+    set("http_version", intern("1.1"))?;
+    set("method", intern(&job.method.to_ascii_uppercase()))?;
+    set("scheme", intern("http"))?;
+    // `urllib.parse.unquote` == percent-decode + UTF-8 errors="replace".
+    let decoded = percent_encoding::percent_decode_str(&job.path).decode_utf8_lossy();
+    set("path", intern(&decoded))?;
+    set("raw_path", PyBytes::new(py, &ascii_replace(&job.path)).into_any())?;
+    set(
+        "query_string",
+        PyBytes::new(py, &ascii_replace(&job.query)).into_any(),
+    )?;
+    set("root_path", intern(""))?;
+    let headers = PyList::empty(py);
+    for (name, value) in &job.headers {
+        headers
+            .append((
+                PyBytes::new(py, name.as_bytes()),
+                PyBytes::new(py, value),
+            ))
+            .map_err(|e| e.to_string())?;
+    }
+    set("headers", headers.into_any())?;
+    scope
+        .set_item("client", ("127.0.0.1", 0))
+        .map_err(|e| e.to_string())?;
+    scope
+        .set_item("server", ("fasterapi-hyper", 0))
+        .map_err(|e| e.to_string())?;
+    set("extensions", PyDict::new(py).into_any())?;
+    Ok(scope)
+}
+
+fn build_request_msg<'py>(py: Python<'py>, body: &[u8]) -> Bound<'py, PyDict> {
+    use pyo3::types::PyBytes;
+    let msg = PyDict::new(py);
+    // Infallible keys/values on a fresh dict.
+    let _ = msg.set_item("type", "http.request");
+    let _ = msg.set_item("body", PyBytes::new(py, body));
+    let _ = msg.set_item("more_body", false);
+    msg
 }
 
 fn run_py_job(job: PyJob) {
-    let result = Python::with_gil(|py| {
-        use pyo3::types::PyBytes;
-        // NOTE: Vec<u8> wouldcross as list[int]; HTTP needs real bytes.
-        let py_headers: Vec<(String, PyObject)> = job
-            .headers
-            .iter()
-            .map(|(k, v)| (k.clone(), PyBytes::new(py, v).into_any().unbind()))
-            .collect();
-        let py_body = PyBytes::new(py, &job.body).into_any().unbind();
-        let helper = py
-            .import("fasterapi._hyper_serve")
-            .map_err(|e| e.to_string())?;
-        let ret = helper
-            .getattr("run_request")
-            .map_err(|e| e.to_string())?
-            .call1((
-                job.app,
-                job.method,
-                job.path,
-                job.query,
-                py_headers,
-                py_body,
-                job.sendfile_ok,
-            ))
-            .map_err(|e| e.to_string())?;
-        ret.extract::<(u16, Vec<(String, String)>, Vec<u8>, String)>()
-            .map_err(|e| e.to_string())
-    });
-    // Streaming sessions: reply first, then park this worker driving the
-    // session loop until stream_close (Rust calls it after the body ends).
-    let stream_sid = match &result {
-        Ok(v) => v.3.clone(),
-        Err(_) => String::new(),
-    };
-    let _ = job.reply.send(result);
-    if !stream_sid.is_empty() {
-        let _ = Python::with_gil(|py| {
-            py.import("fasterapi._hyper_serve")?
-                .getattr("stream_drive")?
-                .call1((stream_sid,))?;
-            Ok::<(), pyo3::PyErr>(())
+    let result: Result<((u16, Vec<(String, String)>, Vec<u8>, u64), Option<PyObject>), String> =
+        Python::with_gil(|py| {
+            let bridge = py_bridge(py)?;
+            let scope = build_http_scope(py, &job)?;
+            let msg = build_request_msg(py, &job.body);
+            let ret = bridge
+                .run_scoped
+                .bind(py)
+                .call1((
+                    job.app.bind(py),
+                    scope,
+                    msg,
+                    job.sendfile_ok,
+                ))
+                .map_err(|e| e.to_string())?;
+            let (status, headers, body, sess) = ret
+                .extract::<(u16, Vec<(String, String)>, Vec<u8>, Option<PyObject>)>()
+                .map_err(|e| e.to_string())?;
+            let sid = match &sess {
+                Some(s) => register_stream(s.clone_ref(py)),
+                None => 0,
+            };
+            Ok(((status, headers, body, sid), sess))
         });
+    // Streaming sessions: reply first, then park this worker driving the
+    // session loop until close() runs (Rust calls it after the body ends).
+    let (reply, drive_sess) = match result {
+        Ok((r, s)) => (Ok(r), s),
+        Err(e) => (Err(e), None),
+    };
+    let _ = job.reply.send(reply);
+    if let Some(s) = drive_sess {
+        let _ = Python::with_gil(|py| s.bind(py).call_method0("drive").map(|_| ()));
     }
 }
 
@@ -1139,7 +1281,7 @@ impl PyWorkerPool {
     }
 }
 
-fn run_lifespan(app: &PyObject, kind: &str) -> Result<(), String> {
+fn run_lifespan(app: &Arc<PyObject>, kind: &str) -> Result<(), String> {
     let app = Python::with_gil(|py| app.clone_ref(py));
     let kind = kind.to_string();
     tokio::task::block_in_place(|| {
@@ -1159,7 +1301,7 @@ fn run_lifespan(app: &PyObject, kind: &str) -> Result<(), String> {
 
 async fn serve_one(
     pool: &PyWorkerPool,
-    app: PyObject,
+    app: Arc<PyObject>,
     req: Request<hyper::body::Incoming>,
     rate_limit: Option<Arc<GovLimiter>>,
 ) -> Result<Response<RespBody>, hyper::Error> {
@@ -1202,11 +1344,10 @@ async fn serve_one(
         return Ok(resp);
     }
     let body = body.to_vec();
-    // Brief GIL grab for the refcount bump; the job owns its app ref.
-    let job_app = Python::with_gil(|py| app.clone_ref(py));
+    // Arc clone: no GIL grab at all on the dispatch path.
     let (tx, rx) = tokio::sync::oneshot::channel();
     let job = PyJob {
-        app: job_app,
+        app: app.clone(),
         method,
         path,
         query,
@@ -1217,7 +1358,7 @@ async fn serve_one(
     };
     // Bounded pool first; overflow degrades to spawn_blocking instead of
     // deadlocking when every worker queue is momentarily full.
-    let out: Result<Result<(u16, Vec<(String, String)>, Vec<u8>, String), String>, String> =
+    let out: Result<Result<(u16, Vec<(String, String)>, Vec<u8>, u64), String>, String> =
         match pool.dispatch(job) {
             Ok(()) => rx.await.map_err(|_| "worker dropped job".to_string()),
             Err(job) => match tokio::task::spawn_blocking(move || {
@@ -1250,7 +1391,7 @@ async fn serve_one(
         .find(|(k, _)| k.eq_ignore_ascii_case("x-fasterapi-sendfile"))
         .map(|(_, v)| v.clone());
     // Streaming responses get chunked encoding — no content-length.
-    let streaming = !stream_sid.is_empty();
+    let streaming = stream_sid != 0;
     for (k, v) in &resp_headers {
         // Skip hop-by-hop / framing headers the server owns (`server` is
         // re-stamped below — the app layer still thinks in uvicorn terms).
@@ -1276,16 +1417,9 @@ async fn serve_one(
     builder = builder.header("server", "fasterapi-hyper");
     // Belt-and-braces: any response path that isn't the streaming lane must
     // release a parked session worker (sendfile wins over streaming).
-    if !stream_sid.is_empty() && sendfile_path.is_some() {
-        let sid = stream_sid.clone();
-        tokio::task::spawn_blocking(move || {
-            let _ = Python::with_gil(|py| {
-                py.import("fasterapi._hyper_serve")?
-                    .getattr("stream_close")?
-                    .call1((sid,))?;
-                Ok::<(), pyo3::PyErr>(())
-            });
-        });
+    if streaming && sendfile_path.is_some() {
+        let sid = stream_sid;
+        tokio::task::spawn_blocking(move || stream_close_rust(sid));
     }
     // Zero-copy file streaming: the app already sent content headers; the
     // bytes flow straight from disk, never through Python.
@@ -1322,28 +1456,17 @@ async fn serve_one(
     if streaming {
         let (tx, mut rx) =
             tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
-        let sid = stream_sid.clone();
+        let sid = stream_sid;
         tokio::task::spawn_blocking(move || {
             // Chunks collected before the stream graduated go out first.
             if !resp_body.is_empty()
                 && tx.blocking_send(Ok(Bytes::from(resp_body))).is_err()
             {
-                let _ = Python::with_gil(|py| {
-                    py.import("fasterapi._hyper_serve")?
-                        .getattr("stream_close")?
-                        .call1((sid.clone(),))?;
-                    Ok::<(), pyo3::PyErr>(())
-                });
+                stream_close_rust(sid);
                 return;
             }
             loop {
-                let step = Python::with_gil(|py| {
-                    py.import("fasterapi._hyper_serve")
-                        .and_then(|h| h.getattr("stream_step"))
-                        .and_then(|f| f.call1((sid.clone(), 1.0f64)))
-                        .and_then(|r| r.extract::<(Vec<Vec<u8>>, bool)>())
-                });
-                match step {
+                match stream_step_rust(sid, 1.0) {
                     Ok((chunks, done)) => {
                         let mut stop = done;
                         for chunk in chunks {
@@ -1362,12 +1485,7 @@ async fn serve_one(
                     }
                 }
             }
-            let _ = Python::with_gil(|py| {
-                py.import("fasterapi._hyper_serve")?
-                    .getattr("stream_close")?
-                    .call1((sid,))?;
-                Ok::<(), pyo3::PyErr>(())
-            });
+            stream_close_rust(sid);
         });
         use futures_util::StreamExt;
         use http_body_util::BodyExt as _BodyExt;
@@ -1382,12 +1500,12 @@ async fn serve_one(
     Ok(builder.body(boxed_full(Bytes::from(resp_body))).unwrap())
 }
 
-fn internal_error() -> (u16, Vec<(String, String)>, Vec<u8>, String) {
+fn internal_error() -> (u16, Vec<(String, String)>, Vec<u8>, u64) {
     (
         500u16,
         vec![("content-type".to_string(), "application/json".to_string())],
         br#"{"detail":"Internal Server Error"}"#.to_vec(),
-        String::new(),
+        0,
     )
 }
 
@@ -1517,12 +1635,10 @@ async fn py_ws_step(
     let _ = &app;
     let res = tokio::task::spawn_blocking(move || {
         Python::with_gil(|py| {
-            let helper = py
-                .import("fasterapi._hyper_serve")
-                .map_err(|e| e.to_string())?;
-            let ret = helper
-                .getattr("ws_step")
-                .map_err(|e| e.to_string())?
+            let bridge = py_bridge(py)?;
+            let ret = bridge
+                .ws_step
+                .bind(py)
                 .call1((sid, opcode, payload, wait_secs))
                 .map_err(|e| e.to_string())?;
             ret.extract::<Vec<(u8, Vec<u8>)>>()
@@ -1545,16 +1661,18 @@ async fn py_ws_step(
 
 fn py_ws_close(sid: String) {
     // Best-effort synchronous cleanup (idempotent server-side).
-    let _res: Result<(), PyErr> = Python::with_gil(|py| {
-        py.import("fasterapi._hyper_serve")?
-            .getattr("ws_close")?
-            .call1((sid,))?;
-        Ok(())
+    let _res: Result<(), String> = Python::with_gil(|py| {
+        py_bridge(py)?
+            .ws_close
+            .bind(py)
+            .call1((sid,))
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     });
 }
 
 async fn serve_ws(
-    app: PyObject,
+    app: Arc<PyObject>,
     req: Request<hyper::body::Incoming>,
 ) -> Result<Response<RespBody>, hyper::Error> {
     fn bad(status: StatusCode, msg: &'static str) -> Result<Response<RespBody>, hyper::Error> {
@@ -1595,16 +1713,14 @@ async fn serve_ws(
     // Join failure can only mean runtime shutdown; report as an error verdict.
     let verdict: Result<Result<(String, String, Vec<(String, String)>), String>, String> =
         tokio::task::spawn_blocking({
-            let app = Python::with_gil(|py| app.clone_ref(py));
+            let app = app.clone();
             move || {
                 Python::with_gil(|py| {
-                    let helper = py
-                        .import("fasterapi._hyper_serve")
-                        .map_err(|e| e.to_string())?;
-                    let ret = helper
-                        .getattr("ws_open")
-                        .map_err(|e| e.to_string())?
-                        .call1((app, path, query, headers, key))
+                    let bridge = py_bridge(py)?;
+                    let ret = bridge
+                        .ws_open
+                        .bind(py)
+                        .call1((app.bind(py), path, query, headers, key))
                         .map_err(|e| e.to_string())?;
                     ret.extract::<(String, String, Vec<(String, String)>)>()
                         .map_err(|e| e.to_string())
@@ -1665,7 +1781,7 @@ async fn serve_ws(
     }
     // The upgrade future only resolves AFTER this 101 goes out, so the pump
     // must run detached — awaiting it here would deadlock. Clone what moves.
-    let pump_app = Python::with_gil(|py| app.clone_ref(py));
+    let pump_app = app.clone();
     let pump_fut = hyper::upgrade::on(req);
     tokio::spawn(async move {
         match pump_fut.await {
@@ -1684,7 +1800,7 @@ async fn serve_ws(
 
 /// Frame pump for one upgraded connection: client frames drive app steps;
 /// idle ticks drain server pushes. The connection belongs to this task.
-async fn ws_pump(app: &PyObject, sid: &str, io: &mut TokioIo<hyper::upgrade::Upgraded>) {
+async fn ws_pump(app: &Arc<PyObject>, sid: &str, io: &mut TokioIo<hyper::upgrade::Upgraded>) {
     // Frame pump: client frames drive app steps; idle ticks drain pushes.
     let mut io: &mut TokioIo<hyper::upgrade::Upgraded> = io;
     let mut frag_op: Option<u8> = None;
@@ -1756,14 +1872,14 @@ async fn ws_pump(app: &PyObject, sid: &str, io: &mut TokioIo<hyper::upgrade::Upg
 /// Deliver one client message (or a poll tick, opcode 0xFF) and forward
 /// queued server frames. Returns true when the session ended.
 async fn forward_ws_frames(
-    app: &PyObject,
+    app: &Arc<PyObject>,
     sid: &str,
     io: &mut TokioIo<hyper::upgrade::Upgraded>,
     opcode: u8,
     payload: Vec<u8>,
     wait_secs: f64,
 ) -> bool {
-    let app_ref = Python::with_gil(|py| app.clone_ref(py));
+    let app_ref = Python::with_gil(|py| app.as_ref().clone_ref(py));
     let (op, data) = if opcode == 0xFF {
         (None, Vec::new())
     } else {
@@ -1824,6 +1940,7 @@ fn serve_asgi(
     let pool = std::sync::Arc::new(PyWorkerPool::new(pool_size));
     // Clone the shared limiter Arc — every request check is GIL-free.
     let rate_limit = bucket.map(|b| b.borrow(py).limiter.clone());
+    let app = Arc::new(app);
     py.allow_threads(|| {
         run_until_ctrl_c(rt, app, host.to_string(), port, pool, rate_limit)
     })
@@ -1832,7 +1949,7 @@ fn serve_asgi(
 
 fn run_until_ctrl_c(
     rt: tokio::runtime::Runtime,
-    app: PyObject,
+    app: Arc<PyObject>,
     host: String,
     port: u16,
     pool: std::sync::Arc<PyWorkerPool>,
@@ -1855,15 +1972,15 @@ fn run_until_ctrl_c(
                     // Disable Nagle: small JSON responses must not wait for ACKs.
                     let _ = stream.set_nodelay(true);
                     let io = TokioIo::new(stream);
-                    // Brief GIL grab per connection for the refcount bump.
-                    let app_ref = Python::with_gil(|py| app.clone_ref(py));
+                    // Arc clone per connection: zero GIL on the accept path.
+                    let app_ref = app.clone();
                     let pool = pool.clone();
                     let rate_limit = rate_limit.clone();
                     let in_flight = in_flight.clone();
                     in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     tokio::spawn(async move {
                         let svc = service_fn(move |req| {
-                            let app_ref = Python::with_gil(|py| app_ref.clone_ref(py));
+                            let app_ref = app_ref.clone();
                             let pool = pool.clone();
                             let rate_limit = rate_limit.clone();
                             async move { serve_one(&pool, app_ref, req, rate_limit).await }
