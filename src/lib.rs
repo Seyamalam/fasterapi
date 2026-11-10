@@ -2020,6 +2020,61 @@ fn solve_scalars(
     Ok((ok, fail))
 }
 
+
+/// SSE frame encoder: comment/event/data/id/retry → wire bytes.
+/// Mirrors Python `_format_frame` exactly: each logical field may carry
+/// embedded newlines which split into repeated prefixed lines; the frame
+/// always ends with \n\n.
+#[pyfunction]
+#[pyo3(signature = (data_str=None, event=None, id=None, retry=None, comment=None))]
+fn sse_encode(
+    data_str: Option<&str>,
+    event: Option<&str>,
+    id: Option<&str>,
+    retry: Option<i64>,
+    comment: Option<&str>,
+) -> PyResult<Vec<u8>> {
+    fn split_lines(s: &str) -> Vec<&str> {
+        s.split(|c| c == '\n' || c == '\r')
+            .filter(|l| !l.is_empty() || true)
+            .collect()
+    }
+    let mut out = String::with_capacity(
+        data_str.map(|d| d.len() + 16).unwrap_or(0) + 48,
+    );
+    if let Some(c) = comment {
+        for line in split_lines(c) {
+            out.push_str(": ");
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if let Some(e) = event {
+        out.push_str("event: ");
+        out.push_str(e);
+        out.push('\n');
+    }
+    if let Some(d) = data_str {
+        for line in split_lines(d) {
+            out.push_str("data: ");
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if let Some(i) = id {
+        out.push_str("id: ");
+        out.push_str(i);
+        out.push('\n');
+    }
+    if let Some(r) = retry {
+        out.push_str("retry: ");
+        out.push_str(&r.to_string());
+        out.push('\n');
+    }
+    out.push('\n');
+    Ok(out.into_bytes())
+}
+
 // ---------------------------------------------------------------------------
 // Module
 // ---------------------------------------------------------------------------
@@ -2031,6 +2086,7 @@ fn _fasterapi_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(fast_json_loads, m)?)?;
     m.add_function(wrap_pyfunction!(fast_json_dumps, m)?)?;
     m.add_function(wrap_pyfunction!(solve_scalars, m)?)?;
+    m.add_function(wrap_pyfunction!(sse_encode, m)?)?;
     m.add_function(wrap_pyfunction!(process_rss_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(tokio_worker_count, m)?)?;
     m.add_function(wrap_pyfunction!(hyper_health, m)?)?;

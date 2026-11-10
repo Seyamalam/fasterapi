@@ -32,6 +32,7 @@ try:  # pragma: no cover - depends on maturin build
             validate_float as _rs_vfloat,
             validate_int as _rs_vint,
             solve_scalars as _rs_solve_scalars,
+            sse_encode as _rs_sse_encode,
             validate_str as _rs_vstr,
         )
     except ImportError:  # top-level layout (pip installed ext next to package)
@@ -52,6 +53,7 @@ try:  # pragma: no cover - depends on maturin build
             validate_float as _rs_vfloat,
             validate_int as _rs_vint,
             solve_scalars as _rs_solve_scalars,
+            sse_encode as _rs_sse_encode,
             validate_str as _rs_vstr,
         )
 

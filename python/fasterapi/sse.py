@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Optional
 
+from . import _rust_bridge as _bridge
 from pydantic import AfterValidator, BaseModel, Field
 from pydantic import model_validator as model_validator  # noqa: F401 (surface parity)
 from starlette.responses import StreamingResponse
@@ -86,6 +87,13 @@ def format_sse_event(
 
     The result always ends with `\\n\\n` (the event terminator).
     """
+    if _bridge.HAS_RUST:
+        try:
+            return _bridge._rs_sse_encode(
+                data_str=data_str, event=event, id=id, retry=retry, comment=comment
+            )
+        except Exception:
+            pass
     lines: list[str] = []
 
     if comment is not None:
