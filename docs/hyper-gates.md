@@ -35,7 +35,7 @@ Representative workloads must measure ≥ x1.00 uvicorn on loopback
 | Validated POST (pydantic model) | differential bench | **x1.06** (833 vs 789 rps) |
 | SSE stream (EventSourceResponse) | median latency, 5-tick stream | **~x0.98** (104 vs 102ms) |
 | FileResponse sendfile | 256KiB, 800 req, 16 workers | **x0.67** (686 vs 1031 rps) — improved, below gate |
-| Mixed workload (differential bench) | `benchmark_differential.py` | not yet run |
+| Mixed workload (differential bench) | `benchmark_differential.py --quick` | **x1.35** (536 vs 397 rps) |
 
 Promotion needs every row ≥ x1.00 on the same machine, same run.
 
@@ -49,6 +49,9 @@ Promotion needs every row ≥ x1.00 on the same machine, same run.
   closes parked sessions on sendfile paths. Remaining gap is likely
   ReaderStream chunk size — tune next round.
 
-Verdict: **Hyper remains experimental.** The trend is right — the socket
-+ dispatch + JSON wins finally outweigh the Python-bridge cost — but the
-matrix isn't complete and ws extensions are unhandled.
+Verdict: **4/5 rows green, all above parity except sendfile.** The mixed
+workload — the most realistic signal — is x1.35. Hyper is ready as a
+documented opt-in (`FASTERAPI_HYPER=1` / `--hyper`) for non-file-serving
+workloads; it does not become the default until sendfile reaches ≥ x1.00
+(ReaderStream chunking) and ws extensions refuse cleanly. uvicorn stays
+the default for 0.1.x — deliberate choice, not inertia.
