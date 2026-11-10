@@ -1215,6 +1215,24 @@ class _FastJSONResponse(JSONResponse):
         return super().render(content)
 
 
+class _RawJSONResponse(JSONResponse):
+    """Endpoint result rendered WITHOUT a jsonable_encoder pre-pass.
+
+    The Rust writer walks the object graph natively — for JSON-native
+    payloads (the common case) this skips Python-side recursion entirely.
+    Exotic leaves (datetime, UUID, Enum, models…) make the writer raise,
+    and the fallback reproduces the exact jsonable_encoder path.
+    """
+
+    def render(self, content: Any) -> bytes:
+        if _bridge.HAS_RUST:
+            try:
+                return _bridge.fast_json_dumps(content, strict=True).encode("utf-8")
+            except Exception:
+                pass
+        return super().render(jsonable_encoder(content))
+
+
 def _make_http_handler(route: _RouteDef, router_deps: list[Depends]) -> Callable[..., Any]:
     async def asgi_app(scope: Any, receive: Any, send: Any) -> None:
         # FastAPI's exact lifecycle: solve (yield enters) → endpoint →
@@ -1303,6 +1321,18 @@ def _make_http_handler(route: _RouteDef, router_deps: list[Depends]) -> Callable
             # SSE: generator endpoint + EventSourceResponse streams frames.
             if _is_sse_route(route) and (inspect.isasyncgen(result) or inspect.isgenerator(result)):
                 await _with_background(_sse_response(result, route.status_code), cache)(scope, receive, send)
+                return
+            # Fast path: no response_model means the endpoint result is the
+            # payload — let _RawJSONResponse render it directly rather than
+            # jsonable_encoder-walking every leaf in Python first.
+            if route.response_model is None:
+                if result is None:
+                    await _with_background(Response(status_code=route.status_code), cache)(scope, receive, send)
+                    return
+                if isinstance(result, Response):
+                    await _with_background(result, cache)(scope, receive, send)
+                    return
+                await _with_background(_RawJSONResponse(result, status_code=route.status_code), cache)(scope, receive, send)
                 return
             try:
                 payload = _serialize_response(result, route)
