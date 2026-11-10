@@ -85,18 +85,79 @@ _PARAMS_CACHE: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 _PARAMS_CACHE_LOCK = threading.RLock()
 
 
-def _resolved_params(
-    fn: Callable[..., Any], sig: inspect.Signature
-) -> list[tuple[str, inspect.Parameter, Any]]:
+def _solve_plan(fn: Callable[..., Any]) -> Optional[list[tuple[str, str, Any]]]:
+    """Compiled param dispatch, cached per function (FastAPI's `dependant`).
+
+    Every branch of the solve loop classifies on static facts — annotation,
+    default marker, param name — except the bare tail (container/path/query/
+    default/required) which keeps its runtime order. The executor replays
+    the identical checks; nothing here changes semantics, only when they're
+    computed.
+    """
     with _PARAMS_CACHE_LOCK:
         plan = _PARAMS_CACHE.get(fn)  # type: ignore[arg-type]
-        if plan is None:
-            plan = [
-                (pname, param, _ann_of(fn, pname, param.annotation))
-                for pname, param in sig.parameters.items()
-            ]
-            _PARAMS_CACHE[fn] = plan  # type: ignore[index]
-        return plan
+        if plan is not None:
+            return plan
+        sig = _signature(fn)
+        if sig is None:
+            return None
+        params = [
+            (pname, param, _ann_of(fn, pname, param.annotation))
+            for pname, param in sig.parameters.items()
+        ]
+    plan = []
+    is_init = getattr(fn, "__name__", "") in ("__init__", "__new__")
+    for pname, param, ann in params:
+        default = param.default
+        empty = inspect.Parameter.empty
+        if is_init and pname in ("self", "cls"):
+            plan.append(("skip", pname, None))
+        elif _is_request_annotation(ann) or (
+            pname == "request" and ann is empty and default is empty
+        ):
+            # Bare `req`/other names still fall through to normal solving —
+            # mirrors the original inner check, which required `request`.
+            plan.append(("request", pname, None))
+        elif ann is BackgroundTasks or (isinstance(ann, str) and ann == "BackgroundTasks"):
+            plan.append(("bg", pname, None))
+        elif ann is SecurityScopes or (isinstance(ann, str) and ann == "SecurityScopes"):
+            plan.append(("scopes", pname, None))
+        elif ann is WebSocket or (isinstance(ann, str) and ann == "WebSocket"):
+            plan.append(("ws_ann", pname, None))
+        elif (
+            pname in ("websocket", "ws", "connection")
+            and default is empty and ann is empty
+        ):
+            # On non-ws requests this falls through to the tail rule — same
+            # aux so the executor can handle both.
+            plan.append(("ws_bare", pname, (ann, default, _container_origin(ann))))
+        elif isinstance(default, Depends):
+            dep_fn = default.dependency
+            if dep_fn is None and (inspect.isclass(ann) or inspect.isfunction(ann)):
+                dep_fn = ann
+            if dep_fn is None:
+                plan.append(("dep_missing", pname, None))
+            else:
+                plan.append(("dep", pname, (dep_fn, default, id(dep_fn))))
+        elif isinstance(default, Param):
+            meta = default
+            alias = meta.alias or pname
+            plan.append(("param", pname, (meta, alias, ann)))
+        elif _is_pydantic_model(ann):
+            plan.append(("model_body", pname, (ann,)))
+        else:
+            plan.append(("tail", pname, (ann, default, _container_origin(ann))))
+    with _PARAMS_CACHE_LOCK:
+        _PARAMS_CACHE[fn] = plan  # type: ignore[index]
+    return plan
+
+
+def _container_origin(ann: Any) -> bool:
+    """True when the bare-annotation body rule applies (dict/list/… markerless)."""
+    origin = get_origin(ann)
+    return ann in (dict, list, tuple, set, frozenset) or origin in (
+        dict, list, tuple, set, frozenset
+    )
 
 
 def _signature(fn: Callable[..., Any]) -> inspect.Signature | None:
@@ -536,10 +597,9 @@ async def _solve_inner(
     solve, but independent deps' I/O overlaps. Yield deps stay sequential —
     their stack-entry order fixes teardown order.
     """
-    sig = _signature(fn)
-    if sig is None:
+    plan = _solve_plan(fn)
+    if plan is None:
         return {}, []
-    params = _resolved_params(fn, sig)
 
     async def _resolve_pending(dep_fn: Any, dep_default: Depends,
                                cache_key: int) -> tuple[str, Any, list[dict[str, Any]]]:
@@ -579,69 +639,47 @@ async def _solve_inner(
     # consumed in signature order inside the loop, preserving sequential
     # semantics (first exception wins at its position).
     pending: dict[str, asyncio.Task] = {}
-    for pname, param, ann in params:
-        default = param.default
-        if not isinstance(default, Depends):
+    for kind, pname, aux in plan:
+        if kind != "dep":
             continue
-        dep_fn = default.dependency
-        if dep_fn is None:
-            if not (inspect.isclass(ann) or inspect.isfunction(ann)):
-                continue
-            dep_fn = ann
-        cache_key = id(dep_fn)
-        if (default.use_cache and cache_key in cache
+        dep_fn, dep_default, cache_key = aux
+        if (dep_default.use_cache and cache_key in cache
                 or (inspect.isclass(dep_fn) and not _is_pydantic_model(dep_fn))
                 or not _dep_tree_pure(dep_fn)):
             continue
         pending[pname] = asyncio.ensure_future(
-            _resolve_pending(dep_fn, default, cache_key)
+            _resolve_pending(dep_fn, dep_default, cache_key)
         )
     kwargs: dict[str, Any] = {}
     errors: list[dict[str, Any]] = []
-    for pname, param, ann in params:
-        # Unbound dunder initializers (`SomeForm.__init__`) carry `self`;
-        # it is never a request parameter.
-        if pname in ("self", "cls") and getattr(fn, "__name__", "") in ("__init__", "__new__"):
+    empty = inspect.Parameter.empty
+    for kind, pname, aux in plan:
+        if kind == "skip":
             continue
-        default = param.default
-
-        # --- Request injection ------------------------------------------------
-        if _is_request_annotation(ann) or pname in ("request", "req") and ann is inspect.Parameter.empty and isinstance(default, inspect.Parameter.empty.__class__):
-            # Only inject when annotation matches or bare `request` with no default.
-            if _is_request_annotation(ann) or (pname == "request" and ann is inspect.Parameter.empty and default is inspect.Parameter.empty):
-                kwargs[pname] = request
-                continue
-
-        # --- BackgroundTasks / SecurityScopes (framework-owned) ---------------
-        if ann is BackgroundTasks or (isinstance(ann, str) and ann == "BackgroundTasks"):
+        if kind == "request":
+            kwargs[pname] = request
+            continue
+        if kind == "bg":
             tasks = cache.get(_BG_KEY)
             if tasks is None:
                 tasks = BackgroundTasks()
                 cache[_BG_KEY] = tasks
             kwargs[pname] = tasks
             continue
-        if ann is SecurityScopes or (isinstance(ann, str) and ann == "SecurityScopes"):
+        if kind == "scopes":
             kwargs[pname] = SecurityScopes()
             continue
-        # --- WebSocket injection (websocket routes only) -----------------------
-        if ann is WebSocket or (isinstance(ann, str) and ann == "WebSocket"):
+        if kind == "ws_ann":
             kwargs[pname] = request
             continue
-        if pname in ("websocket", "ws", "connection") and default is inspect.Parameter.empty \
-                and ann is inspect.Parameter.empty and type(request).__name__ == "WebSocket":
+        if kind == "ws_bare" and type(request).__name__ == "WebSocket":
             kwargs[pname] = request
             continue
-
-        # --- Depends ----------------------------------------------------------
-        if isinstance(default, Depends):
-            dep_fn = default.dependency
-            if dep_fn is None:
-                # `Depends()` with annotation as dependency (FastAPI class-dependency style)
-                if inspect.isclass(ann) or inspect.isfunction(ann):
-                    dep_fn = ann
-                else:
-                    errors.append(_missing(["query", pname]))
-                    continue
+        if kind == "dep_missing":
+            errors.append(_missing(["query", pname]))
+            continue
+        if kind == "dep":
+            dep_fn, default, cache_key = aux
             if pname in pending:
                 tag, value, sub_errors = await pending[pname]
                 if tag == "err":
@@ -651,7 +689,6 @@ async def _solve_inner(
                 else:
                     kwargs[pname] = value
                 continue
-            cache_key = id(dep_fn)
             if default.use_cache and cache_key in cache:
                 kwargs[pname] = cache[cache_key]
                 continue
@@ -689,10 +726,8 @@ async def _solve_inner(
             continue
 
         # --- Explicit Param(...) ---------------------------------------------
-        if isinstance(default, Param):
-            meta = default
-            alias = meta.alias or pname
-            loc = [meta.in_, alias]
+        if kind == "param":
+            meta, alias, ann = aux
             if meta.in_ == "path":
                 raw = path_params.get(pname, path_params.get(alias))
                 if raw is None:
@@ -774,21 +809,19 @@ async def _solve_inner(
             continue
 
         # --- Pydantic model without marker -> body ----------------------------
-        if _is_pydantic_model(ann):
-            val, errs = _resolve_body_param(pname, ann, None, body_json, form, request, body_raw)
+        if kind == "model_body":
+            val, errs = _resolve_body_param(pname, aux[0], None, body_json, form, request, body_raw)
             if errs:
                 errors.extend(errs)
             else:
                 kwargs[pname] = val
             continue
 
-        # --- Bare dict/list without marker -> body (FastAPI rule) --------------
-        # `payload: dict` (or any subscripted container like `list[Item]`)
-        # takes the whole JSON body. A bare `list`/`tuple`/`set` without a
-        # `Body()` marker is unsatisfiable via JSON (FastAPI 422s too).
-        _origin = get_origin(ann)
-        if (ann in (dict, list, tuple, set, frozenset) or _origin in (dict, list, tuple, set, frozenset)) \
-                and default is inspect.Parameter.empty:
+        # --- Tail: bare body / path fallback / query / default / required -----
+        # `ws_bare` lands here on non-websocket requests; `tail` covers the
+        # unclassified remainder. aux = (ann, default, is_container).
+        ann, default, is_container = aux
+        if is_container and default is empty:
             if ann in (list, tuple, set, frozenset):
                 errors.extend(_missing(["body", pname]))
                 continue
@@ -800,8 +833,6 @@ async def _solve_inner(
             else:
                 kwargs[pname] = val
             continue
-
-        # --- Path fallback (name appears in path) ------------------------------
         if pname in path_params:
             val, err = _validate_value(["path", pname], path_params[pname], ann, None)
             if err:
@@ -809,8 +840,6 @@ async def _solve_inner(
             else:
                 kwargs[pname] = val
             continue
-
-        # --- Plain default -> query -------------------------------------------
         if alias_q := query.get(pname):
             val, err = _validate_value(["query", pname], alias_q, ann, None)
             if err:
@@ -818,7 +847,7 @@ async def _solve_inner(
             else:
                 kwargs[pname] = val
             continue
-        if default is not inspect.Parameter.empty:
+        if default is not empty:
             kwargs[pname] = default
             continue
         # Required: decide loc — query by default (FastAPI behavior)
@@ -1193,10 +1222,13 @@ def _make_http_handler(route: _RouteDef, router_deps: list[Depends]) -> Callable
         # only then close the stack (yield teardowns). Teardown therefore
         # runs after background work, never before the response is sent.
         request = Request(scope, receive, send)
-        path_params = dict(request.path_params)
-        query = dict(request.query_params)
-        headers = {k.lower(): v for k, v in request.headers.items()}
-        cookies = dict(request.cookies)
+        # No dict() copies: Starlette's QueryParams/Headers/cookies already
+        # provide get()/[]/`in`/getlist — materializing dicts was pure
+        # per-request overhead.
+        path_params = request.path_params
+        query = request.query_params
+        headers = request.headers
+        cookies = request.cookies
         # Body: keep raw bytes only. The single-model fast path validates
         # straight from bytes; anything else parses lazily (cached) on use.
         body_raw: Optional[bytes] = None

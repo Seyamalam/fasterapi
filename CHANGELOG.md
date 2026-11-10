@@ -52,7 +52,20 @@ are `0.x` until the Hyper host promotes to default.
   on_event, route kwargs, enum/union/nested-model validation, route
   ordering edge cases, rate limiter, JSON writer parity.
 
+### Performance
+- **`AsyncExitStackMiddleware` → pure ASGI**: the request-lifetime stack is
+  now set inline without `BaseHTTPMiddleware` (no `Request` alloc, task
+  group, or in-memory streams per request). ASGI-level micro bench:
+  ~x1.25 vs fastapi (12.2k vs 9.7k req/s) — previously ~x0.45.
+- **`_solve_plan`**: per-function compiled param dispatch (kind-tagged
+  plan entries, FastAPI `dependant`-style) cached in a weakref dict —
+  no more per-request signature classification.
+- **No `dict()` materialization** on `query_params`/`headers`/`cookies` —
+  Starlette's MultiDict types already provide the needed interface.
+
 ### Fixed
+- **Sync endpoints ran inline on the event loop** — any blocking handler
+  stalled all concurrent requests. Now `run_in_threadpool` like FastAPI.
 - **Required `Query`/`Header`/`Cookie` params** silently resolved to
   `Ellipsis` (dead `param.default is empty` check) — now 422 correctly.
 - **Multi-dep 422s** collected only the first failing dep's errors —
