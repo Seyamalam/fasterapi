@@ -343,16 +343,17 @@ class FastAPI(Starlette):
 
     # -- serve -------------------------------------------------------------------
     def serve(self, host: str = "127.0.0.1", port: int = 8000, **kw: Any) -> None:
-        """Run the app: Rust Hyper host when ``FASTERAPI_HYPER=1``, else uvicorn.
+        """Run the app on the Rust Hyper host by default.
 
-        The Hyper host owns sockets + HTTP parsing in Rust and drives this
-        same app object in-process (lifespan included), so bytes stay
-        identical to uvicorn. Spike limits are documented in ``src/lib.rs``.
+        Hyper owns sockets + HTTP parsing in Rust and drives this same app
+        object in-process (lifespan included) — wire bytes stay identical.
+        Escape hatches: ``FASTERAPI_UVICORN=1`` forces uvicorn; a missing
+        compiled extension falls back to uvicorn automatically.
         """
         import os
 
         self.build()
-        if os.environ.get("FASTERAPI_HYPER") == "1" and _bridge.HAS_RUST:
+        if os.environ.get("FASTERAPI_UVICORN") != "1" and _bridge.HAS_RUST:
             try:
                 from ._fasterapi_rs import serve_asgi  # type: ignore
             except ImportError:
