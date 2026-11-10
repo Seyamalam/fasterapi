@@ -132,12 +132,14 @@ pytest tests/ -q
 | Suite | Tests | Result |
 |---|---|---|
 | Differential (`tests/test_parity.py`, FastAPI vs fasterapi) | 26 | all passing |
+| Differential edge cases (`tests/test_parity_extended.py`) | 23 | all passing |
 | Native (`tests/test_fasterapi_native.py`) | 11 | all passing |
 | Auth/background/encoders (`tests/test_parity_security.py`) | 8 | all passing |
 | SSE/docs-adjacent (`tests/test_parity_surface.py`) | 7 | all passing |
 | Export guard (`tests/test_exports.py`) | 3 | all passing |
 | Thread soak (`tests/test_threads.py`) | 3 | all passing |
-| **Total** | **58** | **87 passed** |
+| Hyper host wire (`tests/test_hyper_host.py`) | 6 | all passing |
+| **Total** | **87** | **87 passed** |
 
 Coverage: ping, path/query/header/cookie params, validation shapes (422 `loc`/`type`/`ctx`, multi-error, malformed-JSON `json_invalid`), JSON body + `response_model` (+flags, return-annotation fallback), Form, file upload, DI order + `yield` teardown, `HTTPException`, custom handlers, router prefixes, OpenAPI shapes (full-spec equality, securitySchemes, webhooks), websockets (+auth), guards, DAG, Rust bridge, OAuth2/HTTP/API-key schemes, `Security`, password-grant forms, background tasks, datetime/UUID/Enum encoding, export surface, thread soak, Hyper host (file bytes, 413, middleware fallback, graceful lifespan, ws echo/auth).
 <!-- PARITY:END -->
@@ -146,16 +148,17 @@ Coverage: ping, path/query/header/cookie params, validation shapes (422 `loc`/`t
 
 `src/lib.rs` → `fasterapi._fasterapi_rs` (PyO3):
 
-- **`RustRouter`** — `matchit` radix tree; `app.build()` compiles route
-  patterns into this native primitive. Current request dispatch is still done
-  by Starlette; the native router is not yet the application request path.
+- **`RustRouter`** — `matchit` radix tree; live dispatch via `FastRouter`:
+  unambiguous FULL matches resolve natively, anything it can't prove
+  identical (mounts, convertors, ordering ambiguity, method mismatch) falls
+  back to Starlette's scan.
 - **`fast_json_loads/dumps`** — `simd-json` + `serde_json`, `py.allow_threads`
   so worker threads never block on the GIL.
 - **`validate_int/float/bool/str`** — strict scalar coercion + constraints
   (`ge/le/gt/lt`, lengths, regex) for query/path/header/form, zero-GIL.
-- **`TokenBucket`** — thread-safe `governor` token bucket. The current
-  `RateLimiter` invokes it from Python middleware; rejection is not yet a
-  socket-level path that avoids Python.
+- **`TokenBucket`** — thread-safe `governor` token bucket. `RateLimiter` is
+  a pure-ASGI middleware; on the Hyper host the bucket is checked in Rust
+  before any Python runs (true socket-level rejection).
 - **`DependencyDAG`** — `topological_sort()` + `concurrent_levels()` (Kahn)
   expose a compiled plan. Runtime dependency solving remains in Python and is
   currently sequential; the levels are not yet used to fan out dependencies.
@@ -288,11 +291,11 @@ Micro fast-paths (in-process, no servers):
 
 | Check | Baseline | fasterapi | Speedup |
 |---|---|---|---|
-| JSON `loads` | 0.0359s stdlib | 0.0355s (delegates to stdlib — SIMD parse loses to CPython's fused scanner) | x1.01 |
-| JSON `dumps` | stdlib | Rust direct-writer | x2.71 |
-| Model validate (`loads`+`validate_python` vs `validate_json`) | 0.0041s | 0.0016s | x2.6 |
-| Model dump (`dump_python`+`dumps` vs `dump_json`) | 0.0044s | 0.0017s | x2.56 |
-| Router match | 0.2396s Python | 0.0897s `matchit` | x2.67 |
+| JSON `loads` | 0.0356s stdlib | 0.0316s (delegates to stdlib — SIMD parse loses to CPython's fused scanner) | x1.13 |
+| JSON `dumps` | stdlib | Rust direct-writer | x2.62 |
+| Model validate (`loads`+`validate_python` vs `validate_json`) | 0.0032s | 0.0016s | x1.94 |
+| Model dump (`dump_python`+`dumps` vs `dump_json`) | 0.0043s | 0.0014s | x2.99 |
+| Router match | 0.2076s Python | 0.0796s `matchit` | x2.61 |
 
 Macro load (loopback, httpx concurrency; last full run):
 
