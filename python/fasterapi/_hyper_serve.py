@@ -230,7 +230,13 @@ def run_request(
                     # already-sent response rather than a generic 500.
                     traceback.print_exception(exc)
                 break
-            if "status" in sent and sent.get("stream"):
+            # sendfile responses must never graduate: the sendfile lane
+            # serves the bytes itself, and a parked session's worker would
+            # leak while Python pointlessly keeps reading the file.
+            sendfile = any(
+                k.lower() == "x-fasterapi-sendfile" for k, _ in sent.get("headers", [])
+            )
+            if "status" in sent and sent.get("stream") and not sendfile:
                 import secrets as _secrets
 
                 sid = _secrets.token_hex(8)

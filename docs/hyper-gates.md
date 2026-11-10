@@ -34,7 +34,7 @@ Representative workloads must measure ≥ x1.00 uvicorn on loopback
 | Micro JSON GET | 3000 req, 16 workers | **x1.03** (5453 vs 5316 rps) |
 | Validated POST (pydantic model) | differential bench | **x1.06** (833 vs 789 rps) |
 | SSE stream (EventSourceResponse) | median latency, 5-tick stream | **~x0.98** (104 vs 102ms) |
-| FileResponse sendfile | 256KiB, 800 req, 16 workers | **x0.21** (255 vs 1031 rps) — FAIL |
+| FileResponse sendfile | 256KiB, 800 req, 16 workers | **x0.67** (686 vs 1031 rps) — improved, below gate |
 | Mixed workload (differential bench) | `benchmark_differential.py` | not yet run |
 
 Promotion needs every row ≥ x1.00 on the same machine, same run.
@@ -44,11 +44,10 @@ Promotion needs every row ≥ x1.00 on the same machine, same run.
 - Gate 1: green (87 tests; ws test carries a load-sensitive flake with retry)
 - Gate 2: streaming/disconnect/subprotocol landed; extensions + HTTP/2 open
 - Gate 3: 3/5 workloads — micro-JSON x1.03, validated-POST x1.06, SSE ~x0.98.
-  sendfile x0.21 FAILS: FileResponse graduates to a stream session, the
-  sendfile lane serves the file but the parked session worker is never
-  released (leak) — and throughput is 5x slower either way. Root fix:
-  don't graduate sendfile-marked responses to sessions (Python-side), plus
-  always stream_close parked sessions on non-stream responses (Rust-side).
+  sendfile x0.67 below gate (was x0.21): FileResponse no longer graduates
+  to a stream session when the sendfile marker is present, and Rust
+  closes parked sessions on sendfile paths. Remaining gap is likely
+  ReaderStream chunk size — tune next round.
 
 Verdict: **Hyper remains experimental.** The trend is right — the socket
 + dispatch + JSON wins finally outweigh the Python-bridge cost — but the

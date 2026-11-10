@@ -1274,6 +1274,19 @@ async fn serve_one(
         }
     }
     builder = builder.header("server", "fasterapi-hyper");
+    // Belt-and-braces: any response path that isn't the streaming lane must
+    // release a parked session worker (sendfile wins over streaming).
+    if !stream_sid.is_empty() && sendfile_path.is_some() {
+        let sid = stream_sid.clone();
+        tokio::task::spawn_blocking(move || {
+            let _ = Python::with_gil(|py| {
+                py.import("fasterapi._hyper_serve")?
+                    .getattr("stream_close")?
+                    .call1((sid,))?;
+                Ok::<(), pyo3::PyErr>(())
+            });
+        });
+    }
     // Zero-copy file streaming: the app already sent content headers; the
     // bytes flow straight from disk, never through Python.
     if let Some(path) = sendfile_path {
