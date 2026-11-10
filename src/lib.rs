@@ -1298,7 +1298,8 @@ async fn serve_one(
                 use futures_util::TryStreamExt;
                 use http_body_util::BodyExt as _BodyExt;
                 let stream =
-                    tokio_util::io::ReaderStream::new(file).map_ok(hyper::body::Frame::data);
+                    tokio_util::io::ReaderStream::with_capacity(file, 64 * 1024)
+                        .map_ok(hyper::body::Frame::data);
                 let body = _BodyExt::map_err(
                     http_body_util::StreamBody::new(stream),
                     |e: std::io::Error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) },
