@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import BinaryIO, Optional, Union
+from typing import Any, BinaryIO, Optional, TypeVar, Union
 
 from pydantic import GetJsonSchemaHandler as GetJsonSchemaHandler  # noqa: F401
 from starlette.datastructures import Address as Address  # noqa: F401
@@ -34,3 +34,14 @@ class UploadFile(_StarletteUploadFile):
         headers: Optional[Union[Headers, dict[str, str]]] = None,
     ) -> None:
         super().__init__(file, size=size, filename=filename, headers=headers)
+
+
+class DefaultPlaceholder:
+    """Sentinel wrapper marking a value as overridable by a more specific
+    default (FastAPI's default-merge rule)."""
+
+    def __init__(self, value: Any) -> None:
+        self.value = value
+
+
+DefaultType = TypeVar("DefaultType")
