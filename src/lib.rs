@@ -30,7 +30,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use parking_lot::RwLock;
-use pyo3::conversion::IntoPyObject;
+use pyo3::conversion::{IntoPyObject, IntoPyObjectExt};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString};
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -1898,6 +1898,114 @@ fn run_until_ctrl_c(
     })
 }
 
+
+/// Percent-decode query/form bytes (+%XX+plus) → raw UTF-8 bytes.
+fn pct_decode(b: &[u8]) -> Vec<u8> {
+    fn hex(c: u8) -> Option<u8> {
+        (c as char).to_digit(16).map(|d| d as u8)
+    }
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push((h << 4) | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(if b[i] == b'+' { b' ' } else { b[i] });
+        i += 1;
+    }
+    out
+}
+
+/// Batch-solve scalar request params in Rust.
+///
+/// `specs`: (pname, loc, alias, required, kind) — kind ∈ int|float|bool|str.
+/// Returns (ok, fail): ok = [(pname, value)], fail = [(pname, status, raw)]
+/// where status is "missing" or "invalid". Python owns error-shape parity;
+/// this call only does extraction + coercion.
+#[pyfunction]
+fn solve_scalars(
+    py: Python<'_>,
+    specs: Vec<(String, String, String, bool, String)>,
+    query_string: &[u8],
+    path_pairs: Vec<(String, String)>,
+    header_pairs: Vec<(Vec<u8>, Vec<u8>)>,
+    cookie_pairs: Vec<(String, String)>,
+) -> PyResult<(Vec<(String, Py<PyAny>)>, Vec<(String, String, String)>)> {
+    // Build lookup maps once: query multimap (first wins), path, headers
+    // (latin-1 + lowercased), cookies.
+    let mut qmap: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    if !query_string.is_empty() {
+        for part in query_string.split(|b| *b == b'&') {
+            let (k, v) = match part.iter().position(|b| *b == b'=') {
+                Some(eq) => (&part[..eq], &part[eq + 1..]),
+                None => (part, &[][..]),
+            };
+            let key = String::from_utf8_lossy(&pct_decode(k)).into_owned();
+            qmap.entry(key)
+                .or_insert_with(|| String::from_utf8_lossy(&pct_decode(v)).into_owned());
+        }
+    }
+    let pmap: std::collections::HashMap<&str, &str> =
+        path_pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let mut hmap: std::collections::HashMap<String, &str> = std::collections::HashMap::new();
+    for (k, v) in &header_pairs {
+        let key = String::from_utf8_lossy(k).to_lowercase();
+        hmap.entry(key).or_insert_with(|| std::str::from_utf8(v).unwrap_or(""));
+    }
+    let cmap: std::collections::HashMap<&str, &str> =
+        cookie_pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
+    let mut ok: Vec<(String, Py<PyAny>)> = Vec::new();
+    let mut fail: Vec<(String, String, String)> = Vec::new();
+    for (pname, loc, alias, required, kind) in &specs {
+        let raw: Option<String> = match loc.as_str() {
+            "query" => qmap.get(alias.as_str()).cloned(),
+            "path" => pmap
+                .get(pname.as_str())
+                .or_else(|| pmap.get(alias.as_str()))
+                .map(|s| s.to_string()),
+            "header" => {
+                let key = alias.replace('_', "-").to_lowercase();
+                hmap.get(&key)
+                    .or_else(|| hmap.get(&alias.to_lowercase()))
+                    .map(|s| s.to_string())
+            }
+            "cookie" => cmap.get(alias.as_str()).map(|s| s.to_string()),
+            _ => None,
+        };
+        match raw {
+            None => {
+                if *required {
+                    fail.push((pname.clone(), "missing".to_string(), String::new()));
+                } else {
+                    // Python assigns meta.default.
+                    fail.push((pname.clone(), "default".to_string(), String::new()));
+                }
+            }
+            Some(raw) => {
+                let res: Result<Py<PyAny>, pyo3::PyErr> = match kind.as_str() {
+                    "int" => validate_int(py, &raw, None, None, None, None)
+                        .and_then(|v| v.into_py_any(py)),
+                    "float" => validate_float(py, &raw, None, None, None, None)
+                        .and_then(|v| v.into_py_any(py)),
+                    "bool" => validate_bool(py, &raw).and_then(|v| v.into_py_any(py)),
+                    "str" => raw.clone().into_py_any(py),
+                    _ => Err(err_value("unknown kind".to_string())),
+                };
+                match res {
+                    Ok(v) => ok.push((pname.clone(), v)),
+                    Err(_) => fail.push((pname.clone(), "invalid".to_string(), raw)),
+                }
+            }
+        }
+    }
+    Ok((ok, fail))
+}
+
 // ---------------------------------------------------------------------------
 // Module
 // ---------------------------------------------------------------------------
@@ -1908,6 +2016,7 @@ fn _fasterapi_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", VERSION)?;
     m.add_function(wrap_pyfunction!(fast_json_loads, m)?)?;
     m.add_function(wrap_pyfunction!(fast_json_dumps, m)?)?;
+    m.add_function(wrap_pyfunction!(solve_scalars, m)?)?;
     m.add_function(wrap_pyfunction!(process_rss_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(tokio_worker_count, m)?)?;
     m.add_function(wrap_pyfunction!(hyper_health, m)?)?;

@@ -85,7 +85,9 @@ _PARAMS_CACHE: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 _PARAMS_CACHE_LOCK = threading.RLock()
 
 
-def _solve_plan(fn: Callable[..., Any]) -> Optional[list[tuple[str, str, Any]]]:
+def _solve_plan(
+    fn: Callable[..., Any],
+) -> Optional[tuple[list[tuple[str, str, Any]], list[tuple[str, str, str, bool, str]]]]:
     """Compiled param dispatch, cached per function (FastAPI's `dependant`).
 
     Every branch of the solve loop classifies on static facts — annotation,
@@ -95,9 +97,9 @@ def _solve_plan(fn: Callable[..., Any]) -> Optional[list[tuple[str, str, Any]]]:
     computed.
     """
     with _PARAMS_CACHE_LOCK:
-        plan = _PARAMS_CACHE.get(fn)  # type: ignore[arg-type]
-        if plan is not None:
-            return plan
+        entry = _PARAMS_CACHE.get(fn)  # type: ignore[arg-type]
+        if entry is not None:
+            return entry
         sig = _signature(fn)
         if sig is None:
             return None
@@ -105,7 +107,8 @@ def _solve_plan(fn: Callable[..., Any]) -> Optional[list[tuple[str, str, Any]]]:
             (pname, param, _ann_of(fn, pname, param.annotation))
             for pname, param in sig.parameters.items()
         ]
-    plan = []
+    plan: list[tuple[str, str, Any]] = []
+    scalar_specs: list[tuple[str, str, str, bool, str]] = []
     is_init = getattr(fn, "__name__", "") in ("__init__", "__new__")
     for pname, param, ann in params:
         default = param.default
@@ -143,13 +146,24 @@ def _solve_plan(fn: Callable[..., Any]) -> Optional[list[tuple[str, str, Any]]]:
             meta = default
             alias = meta.alias or pname
             plan.append(("param", pname, (meta, alias, ann)))
+            # Rust-solvable: unconstrained scalar in query/path/header/cookie.
+            _kind = {"int": "int", "float": "float", "bool": "bool", "str": "str"}.get(
+                getattr(ann, "__name__", "") if ann in (int, float, bool, str) else "")
+            if (_kind and meta.in_ in ("query", "path", "header", "cookie")
+                    and getattr(meta, "ge", None) is None and getattr(meta, "le", None) is None
+                    and getattr(meta, "gt", None) is None and getattr(meta, "lt", None) is None
+                    and getattr(meta, "min_length", None) is None
+                    and getattr(meta, "max_length", None) is None
+                    and getattr(meta, "pattern", None) is None):
+                scalar_specs.append((pname, meta.in_, alias, bool(meta.required), _kind))
         elif _is_pydantic_model(ann):
             plan.append(("model_body", pname, (ann,)))
         else:
             plan.append(("tail", pname, (ann, default, _container_origin(ann))))
+    entry = (plan, scalar_specs)
     with _PARAMS_CACHE_LOCK:
-        _PARAMS_CACHE[fn] = plan  # type: ignore[index]
-    return plan
+        _PARAMS_CACHE[fn] = entry  # type: ignore[index]
+    return entry
 
 
 def _container_origin(ann: Any) -> bool:
@@ -597,9 +611,27 @@ async def _solve_inner(
     solve, but independent deps' I/O overlaps. Yield deps stay sequential —
     their stack-entry order fixes teardown order.
     """
-    plan = _solve_plan(fn)
-    if plan is None:
+    entry = _solve_plan(fn)
+    if entry is None:
         return {}, []
+    plan, scalar_specs = entry
+    solved: dict[str, tuple[str, Any]] = {}
+    if scalar_specs and _bridge.HAS_RUST:
+        try:
+            scope = getattr(request, "scope", {}) or {}
+            ok, fail = _bridge._rs_solve_scalars(
+                scalar_specs,
+                scope.get("query_string", b""),
+                list(request.path_params.items()),
+                scope.get("headers", []),
+                list(cookies.items()) if hasattr(cookies, "items") else list(cookies or []),
+            )
+            for pname, v in ok:
+                solved[pname] = ("ok", v)
+            for pname, st, raw in fail:
+                solved[pname] = (st, raw)
+        except Exception:
+            solved = {}
 
     async def _resolve_pending(dep_fn: Any, dep_default: Depends,
                                cache_key: int) -> tuple[str, Any, list[dict[str, Any]]]:
@@ -728,6 +760,25 @@ async def _solve_inner(
         # --- Explicit Param(...) ---------------------------------------------
         if kind == "param":
             meta, alias, ann = aux
+            sres = solved.get(pname)
+            if sres is not None:
+                st, payload = sres
+                if st == "ok":
+                    kwargs[pname] = payload
+                elif st == "missing":
+                    if meta.required:
+                        errors.append(_missing([meta.in_, alias]))
+                    else:
+                        kwargs[pname] = meta.default
+                elif st == "default":
+                    kwargs[pname] = meta.default
+                else:  # invalid → exact error shape via the normal validator
+                    val, err = _validate_value([meta.in_, alias], payload, ann, meta)
+                    if err:
+                        errors.append(err)
+                    else:
+                        kwargs[pname] = val
+                continue
             if meta.in_ == "path":
                 raw = path_params.get(pname, path_params.get(alias))
                 if raw is None:
