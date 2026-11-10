@@ -16,7 +16,24 @@ import sys
 import time
 
 
+def _discover_ref() -> str:
+    """FastAPI-style convention discovery: main:app / app:app / *:application."""
+    import os
+    for mod_name in ("main", "app"):
+        if os.path.exists(f"{mod_name}.py"):
+            for attr in ("app", "application"):
+                try:
+                    mod = __import__("importlib").import_module(mod_name)
+                    if hasattr(mod, attr):
+                        return f"{mod_name}:{attr}"
+                except Exception:
+                    continue
+    raise SystemExit("no app ref given and no main.py/app.py with an `app` found")
+
+
 def load_app(ref: str):  # type: ignore[no-untyped-def]
+    if ref is None:
+        ref = _discover_ref()
     module_name, _, attr = ref.partition(":")
     if not module_name or not attr:
         raise SystemExit(f"app ref must look like 'module:app', got {ref!r}")
@@ -99,14 +116,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="fasterapi", description="fasterapi dev CLI")
     sub = parser.add_subparsers(dest="command", required=True)
     run = sub.add_parser("run", help="serve an app (uvicorn, or --hyper for the Rust host)")
-    run.add_argument("app", help="app reference, e.g. myapp:app")
+    run.add_argument("app", nargs="?", default=None, help="app reference, e.g. myapp:app (auto-detected if omitted)")
     run.add_argument("--host", default="127.0.0.1")
     run.add_argument("--port", type=int, default=8000)
     run.add_argument("--hyper", action="store_true", help="serve via the Rust Hyper host")
     run.add_argument("--reload", action="store_true", help="restart on .py changes")
     run.add_argument("--workers", type=int, default=0, help="tokio workers for --hyper (0 = default)")
     dev = sub.add_parser("dev", help="serve with --reload on (like `fastapi dev`)")
-    dev.add_argument("app", help="app reference, e.g. myapp:app")
+    dev.add_argument("app", nargs="?", default=None, help="app reference, e.g. myapp:app (auto-detected if omitted)")
     dev.add_argument("--host", default="127.0.0.1")
     dev.add_argument("--port", type=int, default=8000)
     dev.add_argument("--hyper", action="store_true", help="serve via the Rust Hyper host")
