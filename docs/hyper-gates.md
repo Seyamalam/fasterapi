@@ -32,7 +32,7 @@ Representative workloads must measure ≥ x1.00 uvicorn on loopback
 | Workload | Method | Latest |
 |---|---|---|
 | Micro JSON GET | 3000 req, 16 workers | **x1.03** (5453 vs 5316 rps) |
-| Validated POST (pydantic model) | — | not yet run |
+| Validated POST (pydantic model) | differential bench | **x1.06** (833 vs 789 rps) |
 | SSE stream (EventSourceResponse) | — | not yet run |
 | FileResponse sendfile | — | not yet run |
 | Mixed workload (differential bench) | `benchmark_differential.py` | not yet run |

@@ -291,20 +291,20 @@ Micro fast-paths (in-process, no servers):
 
 | Check | Baseline | fasterapi | Speedup |
 |---|---|---|---|
-| JSON `loads` | 0.0264s stdlib | 0.0263s (delegates to stdlib — SIMD parse loses to CPython's fused scanner) | x1.01 |
-| JSON `dumps` | stdlib | Rust direct-writer | x2.65 |
-| Model validate (`loads`+`validate_python` vs `validate_json`) | 0.0029s | 0.0015s | x1.99 |
-| Model dump (`dump_python`+`dumps` vs `dump_json`) | 0.0041s | 0.0013s | x3.07 |
-| Router match | 0.1716s Python | 0.0653s `matchit` | x2.63 |
+| JSON `loads` | 0.0275s stdlib | 0.0275s (delegates to stdlib — SIMD parse loses to CPython's fused scanner) | x1.0 |
+| JSON `dumps` | stdlib | Rust direct-writer | x2.58 |
+| Model validate (`loads`+`validate_python` vs `validate_json`) | 0.0028s | 0.0013s | x2.09 |
+| Model dump (`dump_python`+`dumps` vs `dump_json`) | 0.0036s | 0.0012s | x2.97 |
+| Router match | 0.177s Python | 0.0629s `matchit` | x2.82 |
 
 Macro load (loopback, httpx concurrency; last full run):
 
-Run: `2026-11-10`, host `hyper`, speedup **x0.982** (pre-push: micro strict 3x + macro wide band x0.80).
+Run: `2026-11-10`, host `hyper`, speedup **x1.056** (pre-push: micro strict 3x + macro wide band x0.80).
 
 | Server | RPS | p50 | p90 | p99 | RSS |
 |---|---|---|---|---|---|
-| fastapi+uvicorn | 838.5 | 14.981ms | 44.411ms | 65.83ms | 58.0MB |
-| fasterapi | 823.1 | 16.881ms | 42.406ms | 92.806ms | 52.6MB |
+| fastapi+uvicorn | 789.1 | 17.598ms | 43.918ms | 72.191ms | 58.1MB |
+| fasterapi | 833.3 | 16.773ms | 42.662ms | 90.768ms | 52.7MB |
 <!-- BENCH:END -->
 
 Design rule going forward: **as much as possible in Rust,
