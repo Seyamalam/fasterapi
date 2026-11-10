@@ -79,6 +79,24 @@ _HINTS_CACHE: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 _SIG_CACHE: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 _HINTS_CACHE_LOCK = threading.RLock()
 _SIG_CACHE_LOCK = threading.RLock()
+# (pname, param, resolved_annotation) triples per function — annotations are
+# static, so resolve once instead of hitting _resolved_hints per request.
+_PARAMS_CACHE: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+_PARAMS_CACHE_LOCK = threading.RLock()
+
+
+def _resolved_params(
+    fn: Callable[..., Any], sig: inspect.Signature
+) -> list[tuple[str, inspect.Parameter, Any]]:
+    with _PARAMS_CACHE_LOCK:
+        plan = _PARAMS_CACHE.get(fn)  # type: ignore[arg-type]
+        if plan is None:
+            plan = [
+                (pname, param, _ann_of(fn, pname, param.annotation))
+                for pname, param in sig.parameters.items()
+            ]
+            _PARAMS_CACHE[fn] = plan  # type: ignore[index]
+        return plan
 
 
 def _signature(fn: Callable[..., Any]) -> inspect.Signature | None:
@@ -521,6 +539,7 @@ async def _solve_inner(
     sig = _signature(fn)
     if sig is None:
         return {}, []
+    params = _resolved_params(fn, sig)
 
     async def _resolve_pending(dep_fn: Any, dep_default: Depends,
                                cache_key: int) -> tuple[str, Any, list[dict[str, Any]]]:
@@ -560,12 +579,11 @@ async def _solve_inner(
     # consumed in signature order inside the loop, preserving sequential
     # semantics (first exception wins at its position).
     pending: dict[str, asyncio.Task] = {}
-    for pname, param in sig.parameters.items():
+    for pname, param, ann in params:
         default = param.default
         if not isinstance(default, Depends):
             continue
         dep_fn = default.dependency
-        ann = _ann_of(fn, pname, param.annotation)
         if dep_fn is None:
             if not (inspect.isclass(ann) or inspect.isfunction(ann)):
                 continue
@@ -580,12 +598,11 @@ async def _solve_inner(
         )
     kwargs: dict[str, Any] = {}
     errors: list[dict[str, Any]] = []
-    for pname, param in sig.parameters.items():
+    for pname, param, ann in params:
         # Unbound dunder initializers (`SomeForm.__init__`) carry `self`;
         # it is never a request parameter.
         if pname in ("self", "cls") and getattr(fn, "__name__", "") in ("__init__", "__new__"):
             continue
-        ann = _ann_of(fn, pname, param.annotation)
         default = param.default
 
         # --- Request injection ------------------------------------------------
@@ -1244,7 +1261,9 @@ def _make_http_handler(route: _RouteDef, router_deps: list[Depends]) -> Callable
                 if inspect.iscoroutinefunction(route.endpoint):
                     result = await route.endpoint(**kwargs)
                 else:
-                    result = route.endpoint(**kwargs)
+                    # Sync endpoints run in a worker thread like FastAPI —
+                    # inline calls would block the loop under concurrency.
+                    result = await run_in_threadpool(route.endpoint, **kwargs)
                     if inspect.isawaitable(result):
                         result = await result
             except (RequestValidationError, HTTPException):

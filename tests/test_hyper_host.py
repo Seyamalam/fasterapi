@@ -323,15 +323,17 @@ def test_hyper_websocket_bytes_identical(tmp_path):
             time.sleep(0.3)
             got = None
             for _attempt in range(3):
-                sock, send, recv = _ws_raw("127.0.0.1", port, "/auth?token=s3cr3t")
                 try:
+                    sock, send, recv = _ws_raw("127.0.0.1", port, "/auth?token=s3cr3t")
                     got = recv()
-                    if got == ("text", "authed"):
-                        break
-                except (TimeoutError, OSError):
+                except (TimeoutError, OSError, ConnectionError, AssertionError):
                     got = ("timeout", None)
+                    sock = None
                 finally:
-                    sock.close()
+                    if sock is not None:
+                        sock.close()
+                if got == ("text", "authed"):
+                    break
                 time.sleep(0.3)
             assert got == ("text", "authed"), (port, got)
     finally:

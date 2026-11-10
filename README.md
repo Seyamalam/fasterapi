@@ -291,11 +291,11 @@ Micro fast-paths (in-process, no servers):
 
 | Check | Baseline | fasterapi | Speedup |
 |---|---|---|---|
-| JSON `loads` | 0.0356s stdlib | 0.0316s (delegates to stdlib — SIMD parse loses to CPython's fused scanner) | x1.13 |
-| JSON `dumps` | stdlib | Rust direct-writer | x2.62 |
-| Model validate (`loads`+`validate_python` vs `validate_json`) | 0.0032s | 0.0016s | x1.94 |
-| Model dump (`dump_python`+`dumps` vs `dump_json`) | 0.0043s | 0.0014s | x2.99 |
-| Router match | 0.2076s Python | 0.0796s `matchit` | x2.61 |
+| JSON `loads` | 0.0285s stdlib | 0.0291s (delegates to stdlib — SIMD parse loses to CPython's fused scanner) | x0.98 |
+| JSON `dumps` | stdlib | Rust direct-writer | x2.32 |
+| Model validate (`loads`+`validate_python` vs `validate_json`) | 0.0034s | 0.0015s | x2.29 |
+| Model dump (`dump_python`+`dumps` vs `dump_json`) | 0.0041s | 0.0014s | x2.94 |
+| Router match | 0.1986s Python | 0.079s `matchit` | x2.51 |
 
 Macro load (loopback, httpx concurrency; last full run):
 
