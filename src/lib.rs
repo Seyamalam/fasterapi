@@ -1274,6 +1274,33 @@ async fn serve_one(
         }
     }
     builder = builder.header("server", "fasterapi-hyper");
+    // Zero-copy file streaming: the app already sent content headers; the
+    // bytes flow straight from disk, never through Python.
+    if let Some(path) = sendfile_path {
+        match tokio::fs::File::open(&path).await {
+            Ok(file) => {
+                if let Ok(meta) = file.metadata().await {
+                    builder = builder.header("content-length", meta.len());
+                }
+                use futures_util::TryStreamExt;
+                use http_body_util::BodyExt as _BodyExt;
+                let stream =
+                    tokio_util::io::ReaderStream::new(file).map_ok(hyper::body::Frame::data);
+                let body = _BodyExt::map_err(
+                    http_body_util::StreamBody::new(stream),
+                    |e: std::io::Error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) },
+                );
+                return Ok(builder.body(body.boxed()).unwrap());
+            }
+            Err(e) => {
+                eprintln!("fasterapi hyper: sendfile open {path}: {e}");
+                return Ok(builder
+                    .status(StatusCode::NOT_FOUND)
+                    .body(boxed_full(Bytes::from_static(b"Not Found")))
+                    .unwrap());
+            }
+        }
+    }
     // Streaming response: the app is still producing on a Python session —
     // chunks flow through an mpsc into Hyper's body (chunked encoding).
     // Client disconnect drops the stream → we stop polling and close the
@@ -1337,33 +1364,6 @@ async fn serve_one(
             |e: std::io::Error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) },
         );
         return Ok(builder.body(body.boxed()).unwrap());
-    }
-    // Zero-copy file streaming: the app already sent content headers; the
-    // bytes flow straight from disk, never through Python.
-    if let Some(path) = sendfile_path {
-        match tokio::fs::File::open(&path).await {
-            Ok(file) => {
-                if let Ok(meta) = file.metadata().await {
-                    builder = builder.header("content-length", meta.len());
-                }
-                use futures_util::TryStreamExt;
-                use http_body_util::BodyExt as _BodyExt;
-                let stream =
-                    tokio_util::io::ReaderStream::new(file).map_ok(hyper::body::Frame::data);
-                let body = _BodyExt::map_err(
-                    http_body_util::StreamBody::new(stream),
-                    |e: std::io::Error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) },
-                );
-                return Ok(builder.body(body.boxed()).unwrap());
-            }
-            Err(e) => {
-                eprintln!("fasterapi hyper: sendfile open {path}: {e}");
-                return Ok(builder
-                    .status(StatusCode::NOT_FOUND)
-                    .body(boxed_full(Bytes::from_static(b"Not Found")))
-                    .unwrap());
-            }
-        }
     }
     Ok(builder.body(boxed_full(Bytes::from(resp_body))).unwrap())
 }
