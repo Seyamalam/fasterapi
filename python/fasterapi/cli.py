@@ -105,12 +105,21 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--hyper", action="store_true", help="serve via the Rust Hyper host")
     run.add_argument("--reload", action="store_true", help="restart on .py changes")
     run.add_argument("--workers", type=int, default=0, help="tokio workers for --hyper (0 = default)")
+    dev = sub.add_parser("dev", help="serve with --reload on (like `fastapi dev`)")
+    dev.add_argument("app", help="app reference, e.g. myapp:app")
+    dev.add_argument("--host", default="127.0.0.1")
+    dev.add_argument("--port", type=int, default=8000)
+    dev.add_argument("--hyper", action="store_true", help="serve via the Rust Hyper host")
+    dev.add_argument("--workers", type=int, default=0)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "run":
+        return _cmd_run(args)
+    if args.command == "dev":
+        args.reload = True
         return _cmd_run(args)
     return 2
 
