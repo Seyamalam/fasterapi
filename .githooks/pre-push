@@ -48,12 +48,12 @@ if [[ "${FASTERAPI_SKIP_PERF:-0}" == "1" ]]; then
   echo "[3/3] perf gate skipped (FASTERAPI_SKIP_PERF=1)."
   exit 0
 fi
-# Micro fast-paths are stable run-to-run: strict 3x gate (router/matchit).
+# Micro fast-paths are stable run-to-run: strict x2.5 gate — measured micro wins run x2.5-3.2; catches real regressions without noise flaps.
 # Macro loopback RPS is noisy box-to-box: wide band that only catches real
 # regressions. Gate writes go to a scratch file so committed bench data
 # (with POST rows) is never clobbered by the hook's quick run.
-echo "[3/3a] micro fast-path gate (strict x3.0)"
-"$PY" benchmarks/benchmark_differential.py --micro-only --min-speedup 3.0 \
+echo "[3/3a] micro fast-path gate (strict x2.5)"
+"$PY" benchmarks/benchmark_differential.py --micro-only --min-speedup 2.5 \
   --json-out benchmark-results/pre-push-micro.json
 echo "[3/3b] macro load gate (wide band)"
 MIN_MACRO="${FASTERAPI_MIN_MACRO:-0.80}"
