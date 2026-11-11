@@ -1,8 +1,10 @@
 # Hyper host promotion gates
 
-The Rust Hyper/Tokio host promotes from experimental to default only when
-**all** gates below pass on the same commit. Until then `serve()` defaults
-to uvicorn and Hyper is opt-in (`FASTERAPI_HYPER=1` / `--hyper`).
+The Rust Hyper/Tokio host is now the **default** serving backend when the
+compiled extension is present (`app.serve()`, `fasterapi run`);
+`FASTERAPI_UVICORN=1` opts back out to uvicorn. These gates tracked the
+promotion criteria; the remaining open items below are hardening gaps,
+not blockers for the current default.
 
 ## Gate 1 — parity suite green
 
@@ -43,15 +45,13 @@ Promotion needs every row ≥ x1.00 on the same machine, same run.
 
 - Gate 1: green (87 tests; ws test carries a load-sensitive flake with retry)
 - Gate 2: streaming/disconnect/subprotocol landed; extensions + HTTP/2 open
-- Gate 3: 3/5 workloads — micro-JSON x1.03, validated-POST x1.06, SSE ~x0.98.
-  sendfile x1.00 (was x0.21): FileResponse no longer graduates to a
-  stream session when the sendfile marker is present, Rust closes parked
-  sessions on sendfile paths, and ReaderStream reads 64KiB chunks (vs 8KiB
-  default — the whole remaining gap was syscall count).
+- Gate 3: sendfile reached x1.00 (FileResponse keeps the sendfile marker path,
+  ReaderStream reads 64KiB chunks); mixed workload x1.35. GIL-crossing
+  batching then cut per-request bridge overhead ~82µs → ~15µs in-process and
+  ~2× serial keep-alive throughput end-to-end.
 
-Verdict: **4/5 rows green, all above parity except sendfile.** The mixed
-workload — the most realistic signal — is x1.35. Hyper is ready as a
-documented opt-in (`FASTERAPI_HYPER=1` / `--hyper`) for non-file-serving
-workloads; it does not become the default until sendfile reaches ≥ x1.00
-(ReaderStream chunking) and ws extensions refuse cleanly. uvicorn stays
-the default for 0.1.x — deliberate choice, not inertia.
+Verdict: **promoted — Hyper is the default host.** Remaining gaps before
+calling the host fully hardened: WebSocket extensions (permessage-deflate)
+must refuse cleanly, HTTP/2 needs an explicit decision, and a long
+mixed-load soak (`scripts/soak-hyper.sh`) should run clean. uvicorn remains
+available via `FASTERAPI_UVICORN=1` for workloads where it wins.

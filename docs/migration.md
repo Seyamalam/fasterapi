@@ -18,27 +18,29 @@ migrating. FastAPI's optional native telemetry module is not implemented.
 ## Serving
 
 ```bash
-fasterapi run myapp:app --port 8000            # uvicorn (default, max compat)
-fasterapi run myapp:app --port 8000 --hyper    # experimental Rust Hyper host
+fasterapi run myapp:app --port 8000            # Rust Hyper host (default when compiled)
+FASTERAPI_UVICORN=1 fasterapi run myapp:app    # uvicorn fallback
 fasterapi run myapp:app --reload               # dev watcher
 ```
 
-The Hyper host is experimental and not guaranteed to be byte-identical for
-all ASGI apps. Known differences from uvicorn include:
+`app.serve()` picks the Hyper host automatically when the compiled extension
+is present; `FASTERAPI_UVICORN=1` forces uvicorn, and a missing extension
+falls back to uvicorn silently. The Hyper host passes the full 87-test
+differential suite but is not guaranteed byte-identical for every ASGI app.
+Known differences from uvicorn include:
 
 | Area | uvicorn | Hyper host |
 |---|---|---|
 | `Server` header | `uvicorn` | `fasterapi-hyper` |
-| Request bodies | ~100 MB default limit | 16 MiB cap → `413` |
+| Request bodies | ~100 MB default limit | 16 MiB cap → `413` (`FASTERAPI_MAX_BODY` tunes) |
 | HTTP versions | 1.1 (+h11/httptools) | 1.1 only |
-| WebSockets | yes | basic RFC 6455 host support; test your subprotocol/extensions and deployment needs |
+| WebSockets | yes | RFC 6455 host support incl. subprotocol negotiation; extensions (e.g. permessage-deflate) unsupported |
 | Shutdown | SIGTERM/SIGINT | SIGTERM, and SIGINT with a proper process group |
-| Response streaming | streamed | concatenated (same bytes) |
+| Response streaming | streamed | streamed for long-lived responses; fast responses buffer within a ~30ms settle window for content-length parity |
 
-WebSocket routes are implemented in the Hyper host and covered by basic
-echo/auth tests. The host's WebSocket support is still a spike rather than a
-full production protocol stack; use uvicorn if your app relies on advanced
-extensions, subprotocol negotiation, or broader WebSocket compatibility.
+WebSocket routes are implemented in the Hyper host and covered by echo/auth
+tests. If your app relies on WebSocket extensions or advanced negotiation
+behavior, validate it on the Hyper host or pin `FASTERAPI_UVICORN=1`.
 
 ## Import map
 

@@ -53,6 +53,16 @@ are `0.x` until the Hyper host promotes to default.
   ordering edge cases, rate limiter, JSON writer parity.
 
 ### Performance
+- **GIL-crossing batching on the Hyper host**: one Python crossing per
+  request — Rust builds the ASGI scope + `http.request` natively and hands
+  them to a cached `run_scoped` bridge callable (`OnceLock`, no per-request
+  import/getattr/`clone_ref`); the app handle is `Arc<PyObject>` and stream
+  sessions live in a Rust registry keyed by `u64`. Python-side pump drives
+  the loop via `run_forever()` + `loop.stop()` wakes with a no-poll selector
+  shim, removing ~52µs/request of `kqueue.control` syscalls. In-process
+  `run_request` ~82µs → ~15µs; serial keep-alive ~146µs → ~69µs median
+  (≈6.4k → ≈13.2k rps). `run_request` remains as a scope-building compat
+  wrapper.
 - **`AsyncExitStackMiddleware` → pure ASGI**: the request-lifetime stack is
   now set inline without `BaseHTTPMiddleware` (no `Request` alloc, task
   group, or in-memory streams per request). ASGI-level micro bench:

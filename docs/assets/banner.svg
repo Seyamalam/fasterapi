@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 104" width="680" height="104" role="img" aria-label="fasterapi — FastAPI-compatible, Rust-powered">
+  <style>
+    .word { font: 700 44px/1 "SF Mono", "Cascadia Code", "JetBrains Mono", Menlo, Consolas, monospace; letter-spacing: -1.5px; fill: #12332c; }
+    .faster { fill: #00897b; }
+    .api { fill: #f97316; }
+    .tag { font: 500 15.5px/1.35 "SF Mono", "Cascadia Code", "JetBrains Mono", Menlo, Consolas, monospace; fill: #4c6660; }
+    @media (prefers-color-scheme: dark) {
+      .word { fill: #e9f5f1; }
+      .faster { fill: #2dd4bf; }
+      .api { fill: #fb923c; }
+      .tag { fill: #9db8b1; }
+    }
+  </style>
+  <g transform="translate(8,18) scale(1.0625)">
+    <defs>
+      <linearGradient id="fa-g" x1="8" y1="4" x2="56" y2="60" gradientUnits="userSpaceOnUse">
+        <stop offset="0" stop-color="#00bfa5"/>
+        <stop offset="0.55" stop-color="#00a08c"/>
+        <stop offset="1" stop-color="#f97316"/>
+      </linearGradient>
+      <linearGradient id="fa-bolt" x1="22" y1="10" x2="44" y2="56" gradientUnits="userSpaceOnUse">
+        <stop offset="0" stop-color="#ffffff"/>
+        <stop offset="1" stop-color="#ffe9d6"/>
+      </linearGradient>
+    </defs>
+    <path d="M32 3.2 56.4 17.3v28.4L32 59.8 7.6 45.7V17.3Z"
+          fill="url(#fa-g)" stroke="url(#fa-g)" stroke-width="6" stroke-linejoin="round"/>
+    <path d="M37.8 10.5 19.2 35.4h9.4L24.6 53.5l20.6-27.1h-9.9Z"
+          fill="url(#fa-bolt)" stroke="#083c33" stroke-opacity="0.35" stroke-width="1.4" stroke-linejoin="round"/>
+  </g>
+  <text class="word" x="96" y="52"><tspan class="faster">faster</tspan><tspan class="api">api</tspan></text>
+  <text class="tag" x="98" y="78">FastAPI-compatible, Rust-powered · Hyper host, native dispatch</text>
+</svg>
